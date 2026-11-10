@@ -2,7 +2,7 @@
 
 CSV 输出 time_ms 与 Counter 原名列；JSON 使用 ios_gpu_counter.rows.v2，保留质量统计与结束状态。
 
-可直接读取的合成样例：[精简 CSV](examples/sample.csv)、[详细 JSON](examples/sample.json)。CSV 展示时间和指标值；JSON 另外展示质量计数、修正和尾窗信息。样例只用于说明格式，不代表设备测量。
+可直接读取的合成样例：[精简 CSV](examples/sample.csv)、[详细 JSON](examples/sample.json)。CSV 展示时间和指标值；JSON 另外展示质量计数和尾窗信息。样例只用于说明格式，不代表设备测量。
 
 ## 1. 时间与聚合
 
@@ -32,7 +32,7 @@ CSV 输出 time_ms 与 Counter 原名列；JSON 使用 ios_gpu_counter.rows.v2�
 | `sample_count` | 该窗口收到的样本记录数，含基线、重复、异常 |
 | `baseline_count` / `duplicate_count` | 不参与均值的基线与重复样本数 |
 | `invalid_sample_count` | 状态异常或至少一个 Counter 无效的样本数；该样本其他有效项仍可参与均值 |
-| `adjusted_sample_count` | 包含显式修正的样本数，例如已验证条件下的 A15 回绕修正；不保存原始数值 |
+| `adjusted_sample_count` | 为读取旧结果保留的字段；当前采集不做设备专用数值修正，值为 0 |
 | `valid_counts` | 每项 Counter 实际参加均值的数值数量 |
 | `values` | 每项 Counter 的均值；无有效值时为 null |
 | `status` | 以下四种窗口质量状态 |
@@ -81,7 +81,7 @@ CSV 输出 time_ms 与 Counter 原名列；JSON 使用 ios_gpu_counter.rows.v2�
 | `rows` | 逐个追加的 WindowRecord，null 表示无有效值 |
 | `result` | 收尾时写入 status、stop_reason、row_count、ended_at；现场采集路径另有 capture 摘要 |
 
-result.capture 包含 collection_elapsed_s、sample_count、sample_span_s、row_count、has_values、metadata_received、console_error、errors、lifecycle 和 receive_queue。仅保存固定统计与有界错误（最多 16 条，每条最多 512 字符）；lifecycle 仅记 start/stop/flush 状态与当时已处理样本数，不保存原始 RPC 回复。文件内计数在输出尾窗后更新。完整收尾耗时 shutdown_elapsed_s 由内存 RunResult.details/诊断报告记录，不回写已经完成的文件。
+result.capture 包含 collection_elapsed_s、sample_count、sample_span_s、row_count、has_values、metadata_received、console_error、sample_errors、errors、lifecycle 和 receive_queue。sample_errors 按样本状态统计异常数量；errors 记录导致采集/收尾失败的错误，最多 16 条、每条最多 512 字符。lifecycle 仅记 start/stop/flush 状态与当时已处理样本数，不保存原始 RPC 回复。文件内计数在输出尾窗后更新。完整收尾耗时 shutdown_elapsed_s 由内存 RunResult.details/诊断报告记录，不回写已经完成的文件。
 
 正式采集停止原因包括 user_stop、cancelled、capture_error。具体异常阶段在 errors 中；断连/取消/解析失败/收尾错误使会话非 completed。极晚资源清理失败会使退出状态非零，但不重写已完成文件，应结合 stderr/退出码判断。
 
@@ -90,6 +90,11 @@ result.capture 包含 collection_elapsed_s、sample_count、sample_span_s、row_
 写入过程使用 `<output>.part`：首行是白名单 header 和 rows 数组起始，每个窗口独占一个物理行（字符串中的换行被 JSON 转义），最后追加合法 footer。正常/可控异常 finish 后关闭并重命名到目标，最终文件可由严格 JSON 解析器读取，不保留 `.part`。
 
 ## 6. 错误、恢复与资源约束
+
+- 所有设备采用相同的异常样本策略：累计字段负差分标记 counter_reset_or_wrap，不猜位宽、不加 2^32。整条样本不参与指标均值，原始读数作为后续递增样本的差分基线；倒序或同时间戳异常不替换基线。
+- 时间、周期、整数精度等样本错误同样跳过；单个公式失败仅跳过该 Counter 的值。stderr 输出 [ERROR]、原因、样本序号与相对时间；同类错误首次及每累计 1000 条提示，结束时输出完整计数，--console none 也会显示错误。正常基线和完全重复记录不报 ERROR。
+- 样本错误日志的写入失败不阻止结果保存；即使错误流不可写，异常数量和质量标记仍保留在 JSON 中。
+- 跳过异常后继续采集，不补零；有可用数据但存在异常时为 partial，退出码 1；全无有效数据为 failed。无法解释的协议布局、元数据变更、断连及写盘失败仍按原有保护停止，不强行跳过继续生成不可靠结果。
 
 - 输出后缀必须匹配 csv/json。路径检查在写入前验证目录可创建临时文件、目标及 `.part` 不存在；实际打开仍使用排他创建。Windows 最终重命名拒绝覆盖运行期间出现的目标文件。
 - 每个窗口 flush 到操作系统；不声称 fsync 级断电保护。只保存当前窗口和固定统计量，不积累整场 rows。

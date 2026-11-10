@@ -55,10 +55,6 @@ except (ImportError, OSError) as exc:
 
 GPU_CHANNEL = "com.apple.instruments.server.services.gpu"
 SAFE_INTEGER = 2**53 - 1
-# 仅匹配实机验证过的公式版本，不将所有累计计数器一律当作 32 位。
-# Match only the device-validated formula revision; do not assume all accumulators are 32-bit.
-A15_FORMULA_SHA256 = "2e11c9890068f4c61fe694bd3a51beeff9518fe21c1a66859c319f18932a28cc"
-A15_CLOCK_COUNTER = "_792173079ffc5aacc2cea817d8812166e71ea17309e294d24ee2cc88d2fb1e8e"
 SPECIAL_FIELDS = {
     "GRC_TIMESTAMP", "GRC_GPU_CYCLES", "GRC_ENCODER_ID",
     "GRC_KICK_TRACE_ID", "GRC_SAMPLE_TYPE",
@@ -553,14 +549,12 @@ class Decoder:
         self.engine_error = None
         self.previous = None
         self.origin = None
-        self.validated_clock_wrap = False
 
     def metadata(self, payload):
         self.version += 1
         self.previous = None
         self.engine = None
         self.engine_error = None
-        self.validated_clock_wrap = False
         if isinstance(payload, dict):
             obj = {str(k): v for k, v in payload.items()}
             self.counters, self.raw_fields = obj["0"], obj["1"]
@@ -573,8 +567,6 @@ class Decoder:
         else:
             raise ValueError("unknown metadata format")
         source_hash = hashlib.sha256(source.encode()).hexdigest() if source is not None else None
-        self.validated_clock_wrap = (source_hash == A15_FORMULA_SHA256 and gpu.get("gpu_type") == "G14P"
-                                     and self.numer * 3 == self.denom * 125)
         minimum = 5 if source is not None else 1
         if not self.counters or any(not isinstance(c, list) or len(c) < minimum
                                     or not isinstance(c[0], str) for c in self.counters):
@@ -610,7 +602,10 @@ class Decoder:
         for row in struct.iter_unpack("<" + "Q" * width, data):
             timestamp, *raw = row
             previous = self.previous
-            self.previous = row
+            # 倒序或同时间戳的异常记录不替换基线；递增记录可作为下一条的原始基线。
+            # Backwards or equal-time invalid records must not replace the baseline; increasing records can seed the next delta.
+            if previous is None or timestamp > previous[0]:
+                self.previous = row
             if self.origin is None:
                 self.origin = timestamp
             elapsed_ns = (timestamp - self.origin) * self.numer / self.denom
@@ -644,20 +639,10 @@ class Decoder:
                 if name not in SPECIAL_FIELDS and not instantaneous:
                     value -= previous[i + 1]
                     if value < 0:
-                        wrapped = value + 2**32
-                        tick_delta = timestamp - previous[0]
-                        if (self.validated_clock_wrap and name == A15_CLOCK_COUNTER
-                                and raw[i] < 2**32 and previous[i + 1] < 2**32
-                                and abs(wrapped - tick_delta) <= 8):
-                            # 由独立 Mach 时钟校验回绕量；保留原始值并记录显式修正。
-                            # Validate the wrap against the independent Mach clock; retain raw values and record the correction.
-                            sample.setdefault("adjustments", []).append({
-                                "field": name, "kind": "validated_32bit_clock_wrap",
-                                "original_delta": str(value), "corrected_delta": str(wrapped),
-                                "mach_tick_delta": str(tick_delta), "difference_ticks": wrapped - tick_delta})
-                            value = wrapped
-                        else:
-                            error = "counter_reset_or_wrap"
+                        # 不猜测计数位宽或回绕原因，所有设备统一跳过该样本。
+                        # Never guess counter width or the cause of a decrease; skip this sample on every device.
+                        error = "counter_reset_or_wrap"
+                        sample["errors"][name] = "counter_decreased"
                 # 仅当公式引用绝对时间戳时，才需要将其传入 JS。
                 # Absolute timestamp does not need to enter JS unless referenced by formula.
                 values[name.replace(" ", "_").replace(":", "_")] = value
@@ -1019,6 +1004,28 @@ class ParsedPipeline:
         self.failed = False
         self.sample_count = 0
         self.sample_span_s = 0.0
+        self.sample_errors = {}
+
+    @staticmethod
+    def log_sample_error(message):
+        """错误日志不可写时仍保留质量统计和结果文件。 / Preserve quality statistics and results if error logging is unavailable."""
+        try:
+            print(message, file=sys.stderr, flush=True)
+        except (OSError, UnicodeError, ValueError):
+            pass
+
+    def report_sample_error(self, sample):
+        """输出有界错误提示，不让连续异常刷屏。 / Report bounded errors without flooding on repeated invalid samples."""
+        reason = sample["status"]
+        if reason in ("valid", "baseline", "duplicate"):
+            return
+        count = self.sample_errors.get(reason, 0) + 1
+        self.sample_errors[reason] = count
+        if count == 1 or count % 1000 == 0:
+            detail = "; ".join(f"{name}: {error}" for name, error in list(sample.get("errors", {}).items())[:3])[:256]
+            action = "跳过异常指标值 / Invalid counter values skipped" if sample["values"] else "跳过异常样本 / Invalid sample skipped"
+            self.log_sample_error(f"[ERROR] {action}: reason={reason}, sample={self.sample_count + 1}, "
+                                  f"time_s={sample['elapsed_ns'] / 1e9:.6f}, count={count}; {detail}")
 
     def process(self, payload):
         try:
@@ -1052,6 +1059,7 @@ class ParsedPipeline:
             if self.windows is None:
                 raise ValueError("samples_before_metadata")
             for sample in self.decoder.samples(count, body):
+                self.report_sample_error(sample)
                 self.windows.add(sample)
                 self.sample_count += 1
                 self.sample_span_s = max(self.sample_span_s, sample["elapsed_ns"] / 1e9)
@@ -1062,6 +1070,10 @@ class ParsedPipeline:
         if self.writer is None:
             raise ValueError("no_counter_metadata")
         self.windows.finish()
+        if self.sample_errors:
+            summary = ", ".join(f"{reason}={count}" for reason, count in self.sample_errors.items())
+            self.log_sample_error(f"[ERROR] 异常数据汇总 / Invalid data summary: {summary}；"
+                                  "可用 --debug 保存原始数据 / Use --debug to retain raw data.")
         if details is not None:
             details.update(self.statistics())
         return self.writer.finish(reason, failed or self.failed, details)
@@ -1071,6 +1083,7 @@ class ParsedPipeline:
                 "metadata_received": self.metadata_hash is not None,
                 "row_count": self.writer.rows if self.writer else 0,
                 "has_values": self.writer.has_values if self.writer else False,
+                "sample_errors": dict(self.sample_errors),
                 "console_error": self.output.console_error if self.output else None}
 
     def close(self):

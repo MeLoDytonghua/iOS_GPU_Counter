@@ -31,7 +31,7 @@
       "baseline_count": 1,
       "duplicate_count": 0,
       "invalid_sample_count": 1,
-      "adjusted_sample_count": 1,
+      "adjusted_sample_count": 0,
       "valid_counts": {
         "ALU Utilization": 2,
         "Other": 1
