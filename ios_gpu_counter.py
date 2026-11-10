@@ -169,33 +169,27 @@ def print_error(exc):
 
 
 class CaptureProgress:
-    """仅汇报主机状态，不生成或重复 Counter 数据行。
-    Report host-side progress without generating or repeating counter rows.
+    """只在等待状态切换及数据到达时提示，不定时刷新。
+    Report waiting transitions and incoming data only, without periodic refresh.
     """
-    def __init__(self, statistics, interval=5, stream=None):
-        self.statistics = statistics
-        self.interval = interval
+    def __init__(self, stream=None):
         self.stream = stream if stream is not None else sys.stderr
-        self.phase = "等待首批 / waiting for first batch"
-        self.stopped = asyncio.Event()
+        self.waiting = False
 
-    def text(self):
-        stats = self.statistics()
-        phase = self.phase
-        if stats["sample_count"] and phase.startswith("等待首批"):
-            phase = "等待下一批 / waiting for next batch"
-        return (f"[{phase}] 已解析 / parsed={stats['sample_count']}，已写行 / rows={stats['row_count']}，"
-                f"设备时间 / device span={stats['sample_span_s']:.3f}s；设备分批回传 / batched delivery")
+    def emit(self, text):
+        try:
+            print(text, file=self.stream, flush=True)
+        except (OSError, UnicodeError, ValueError):
+            pass
 
-    async def run(self):
-        while not self.stopped.is_set():
-            try:
-                await asyncio.wait_for(self.stopped.wait(), self.interval)
-            except asyncio.TimeoutError:
-                try:
-                    print(self.text(), file=self.stream, flush=True)
-                except (OSError, ValueError):
-                    return
+    def wait(self):
+        if not self.waiting:
+            self.waiting = True
+            self.emit("[等待数据 / Waiting for data]")
+
+    def received(self, count):
+        self.waiting = False
+        self.emit(f"[收到数据 / Data received] samples: {count}")
 
 
 class GpuEventQueue(asyncio.Queue):
@@ -971,7 +965,6 @@ class WindowOutput:
         self.writer, self.console = writer, console
         self.stream = stream if stream is not None else sys.stdout
         self.names = writer.names if console == "all" else sorted(KEY_COUNTERS)
-        self.printed_header = False
         self.console_error = None
 
     def emit(self, record):
@@ -979,14 +972,11 @@ class WindowOutput:
         if self.console == "none" or self.console_error:
             return
         try:
-            display = csv.writer(self.stream, lineterminator="\n")
-            if not self.printed_header:
-                display.writerow(["start_s", "end_s", "status", *self.names])
-                self.printed_header = True
-            display.writerow([record.start_s, record.end_s, record.status,
-                              *[record.values.get(n) if record.values.get(n) is not None else "unavailable"
-                                for n in self.names]])
-            self.stream.flush()
+            # 指标放在 values 中，避免原名与时间/status 键冲突；保留原始数值精度。
+            # Nest counters under values to avoid time/status key collisions and preserve numeric precision.
+            row = {"start_s": record.start_s, "end_s": record.end_s, "status": record.status,
+                   "values": {name: record.values.get(name) for name in self.names}}
+            print(json.dumps(row, ensure_ascii=False, allow_nan=False), file=self.stream, flush=True)
         except (OSError, UnicodeError, ValueError) as exc:
             self.console_error = type(exc).__name__
 
@@ -1328,9 +1318,7 @@ async def collect_parsed(service, worker, output, format="csv", stop_event=None,
     processing_ok = True
     pending_chunks = None
     shutdown_deadline = None
-    progress = CaptureProgress(lambda: worker.statistics)
-    progress.phase = "正在启动 / starting"
-    progress_task = asyncio.create_task(progress.run())
+    progress = CaptureProgress()
     debug = getattr(service, "debug", None)
 
     def failure(stage, exc):
@@ -1353,13 +1341,13 @@ async def collect_parsed(service, worker, output, format="csv", stop_event=None,
             lifecycle.append({"stage": name, "status": "error", "samples_processed": worker.statistics["sample_count"]})
             raise
 
-    async def process(payload, interruptible=False):
+    async def process(payload, interruptible=False, announce=True):
         nonlocal processing_ok, pending_chunks
         if not processing_ok:
             return
-        previous_phase = progress.phase
-        if isinstance(payload, list) and len(payload) >= 5 and payload[0] == 1:
-            progress.phase = "解析设备批次 / processing batch"
+        if (announce and isinstance(payload, list) and len(payload) >= 5 and payload[0] == 1
+                and type(payload[3]) is int and payload[3] > 0):
+            progress.received(payload[3])
         try:
             chunks = iter(processing_chunks(payload))
             for chunk in chunks:
@@ -1373,8 +1361,6 @@ async def collect_parsed(service, worker, output, format="csv", stop_event=None,
         except Exception:
             processing_ok = False
             raise
-        finally:
-            progress.phase = previous_phase
 
     async def drain(grace):
         until = min(shutdown_deadline, loop.time() + grace)
@@ -1389,10 +1375,9 @@ async def collect_parsed(service, worker, output, format="csv", stop_event=None,
 
     try:
         await rpc("start", service.start, can_stop=True)
-        progress.phase = "等待首批 / waiting for first batch"
         if on_started:
             on_started.set()
-        print("已启动 GPU Counter，等待设备批次 / GPU started; waiting for device batches", file=sys.stderr, flush=True)
+        print("GPU Counter 已启动 / GPU started", file=sys.stderr, flush=True)
         while True:
             now = loop.time()
             if debug is not None:
@@ -1408,6 +1393,8 @@ async def collect_parsed(service, worker, output, format="csv", stop_event=None,
                 raise TimeoutError("first_sample_timeout")
             if service.events.empty() and now - last_message >= idle_timeout:
                 raise TimeoutError("notification_idle_timeout")
+            if service.events.empty():
+                progress.wait()
             try:
                 payload = await asyncio.wait_for(service.events.get(), .1)
             except asyncio.TimeoutError:
@@ -1430,7 +1417,6 @@ async def collect_parsed(service, worker, output, format="csv", stop_event=None,
         elapsed = loop.time() - started
         shutdown_started = loop.time()
         shutdown_deadline = shutdown_started + shutdown_timeout
-        progress.phase = "正在收尾 / draining"
         print("正在停止并保存尾部数据 / Stopping and draining GPU data", file=sys.stderr, flush=True)
         try:
             await rpc("stop", service.stop)
@@ -1439,7 +1425,7 @@ async def collect_parsed(service, worker, output, format="csv", stop_event=None,
         try:
             if pending_chunks is not None and processing_ok:
                 for chunk in pending_chunks:
-                    await process(chunk)
+                    await process(chunk, announce=False)
             await drain(drain_timeout)
             # 只有早期消息全部解码后才能取尾；解析失效时保留已有结果并停止消费。
             # Fetch the tail only after earlier messages; stop consuming after parsing becomes invalid.
@@ -1456,7 +1442,6 @@ async def collect_parsed(service, worker, output, format="csv", stop_event=None,
         if service.failure:
             failure("service", ConnectionError(service.failure))
         if cleanup is not None:
-            progress.phase = "关闭连接 / closing connection"
             try:
                 await stage_wait(cleanup(), budget(), "connection_close")
             except Exception as exc:
@@ -1472,7 +1457,6 @@ async def collect_parsed(service, worker, output, format="csv", stop_event=None,
                                         "max_messages": service.events.maxsize,
                                         "max_payload_bytes": service.events.max_bytes}
         result = None
-        progress.phase = "完成文件 / finalizing output"
         try:
             if worker.broken or loop.time() >= shutdown_deadline:
                 raise TimeoutError("finalization_budget_exhausted_or_worker_unavailable")
@@ -1498,8 +1482,6 @@ async def collect_parsed(service, worker, output, format="csv", stop_event=None,
             print("采集异常 / Capture error: " + error, file=sys.stderr)
         if errors:
             print("下一步 / Next: " + error_guidance(RuntimeError(errors[0])), file=sys.stderr)
-        progress.stopped.set()
-        await progress_task
         return result
 
 

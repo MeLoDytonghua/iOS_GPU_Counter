@@ -23,7 +23,7 @@ CSV 输出 time_ms 与 Counter 原名列；JSON 使用 ios_gpu_counter.rows.v2�
 
 下面是内部及 JSON 的完整字段，不是 CSV 列清单。CSV 将 start_s 乘以 1000 转为 time_ms，加各项 values；统计口径和异常判断不因简化列而改变。终端仍显示秒单位的 start_s/end_s/status 与所选 Counter，Counter 数值与文件相同。
 
-每 5 秒状态只输出到 stderr，不属于 WindowRecord，也不写入数据表；统计来自最近一次工作进程确认的批次。正常录制持续到 Ctrl+C，收到停止请求后先完成在途处理再按既有顺序收尾；实际行数/尾窗以设备时间为准，无定时结束或时间裁剪。
+等待/收到数据的状态只在事件发生时输出到 stderr，不定时刷新，也不写入数据表。终端数据每行一个 JSON 对象，含 start_s、end_s、status、values；指标名和值位于 values 中，无 CSV 表头，缺失值为 null，数值精度与文件一致。正常录制持续到 Ctrl+C，收到停止请求后先完成在途处理再按既有顺序收尾；实际行数/尾窗以设备时间为准，无定时结束或时间裁剪。
 
 | 字段 | 定义 |
 |---|---|
