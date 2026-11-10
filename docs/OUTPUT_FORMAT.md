@@ -118,3 +118,37 @@ README 的 30 项字段来自 iPhone 13 Pro / A15 / iOS 18.5 profile 3；逐项�
 - Partial Renders Count 的设备描述为 encoder 内部分渲染次数；所有 Counter 导出仍是有效样本均值，不是秒内总数、每帧次数或 App 独占值。
 
 兼容范围与已知限制见 [使用说明](USAGE.md#兼容性与已知限制)。字段含义以对应设备元数据为依据；文字说明不等于已完成单位识别或跨工具数值对标。
+
+## Debug 附加文件
+
+`capture --debug` 不修改正常结果 schema，另存 `captures/<本次时间戳>/debug/`。这是 pymobiledevice3 解码后的服务载荷归档，不是原始 DTX 帧或 USB 抓包。
+
+| 文件 | 内容 |
+|---|---|
+| session.json | schema=ios_gpu_counter.debug.v1；创建/关闭时间、parsed_output、消息数、二进制字节数；state 为 recording/closed/failed |
+| messages.jsonl | 每行一条完整记录：sequence、received_at、event、payload、metadata_files |
+| metadata/NNNNNNNN_MMM.json | 元数据主体，使用下述带类型编码；同样的元数据重复返回也单独保存 |
+| scripts/NNNNNNNN_MMM.js | 从相应元数据取出的 JS 字符串，以 UTF-8 保存，不修改换行、公式、空格或函数名 |
+| samples/NNNNNNNN_MMM.bin | 原样保存的 bytes/bytearray 载荷，不做差分、限幅或回绕修正；单条消息可引用多个文件 |
+
+NNNNNNNN 为主机记录顺序号，MMM 为该消息内的文件编号。它们不是设备的帧号。`received_at` 是主机观察到通知或 RPC 返回的 UTC 时间，不能替代样本内设备时间戳，也不代表底层 DTX 帧的精确到达顺序。
+
+event 包括 notification、rpc.device_info、rpc.mach_time_info、rpc.configure、rpc.start、rpc.stop、rpc.flush。session 事件由主机补充设备时间基准及解析会话信息，不冒充设备通知。flush 的原始整体返回值保存一次，随后解析器才展开其中的尾包。
+
+payload 中保留列表顺序和标量值。为避免 JSON 丢失类型，采用以下编码，metadata 文件使用同一规则：
+
+| 标记 | 含义 |
+|---|---|
+| `{"$map": [[key, value], ...]}` | 字典；键和值递归编码，整数键 1 与字符串键 "1" 不合并 |
+| `{"$tuple": [...]}` | 元组；普通列表仍为 JSON 数组 |
+| `{"$integer": "..."}` | 绝对值超过 2^53−1 的整数，避免消费端按浮点读取时失真 |
+| `{"$binary": {"path": "samples/...bin", "length": 304, "sha256": "..."}}` | 相对 debug 目录的文件引用、字节长度及校验值；长度仅为示例 |
+| `{"$ns_error": [...]}` | NSError 的 code、domain、user_info，按相同规则递归编码 |
+| `{"$float": "nan"}` / `"inf"` / `"-inf"` | 原始非有限浮点，不把它们写成正常指标数值 |
+| `{"$datetime": "..."}` | 库解码后的日期时间，ISO 表示 |
+
+所有原始字典都包成 $map，因此设备自己的 `$integer` 等键不会被误认成编码标记。不支持的载荷类型会明确报错，不使用 str/repr 静默代替原始对象。
+
+记录在接收回调中送入独立写入进程，早于 512 条子批拆分和数值解析。队列最多 2,048 条待处理消息，并有估算 64 MiB 载荷预算。磁盘失败、工作进程退出、队列溢出或关闭超时均使采集显式失败或 partial；保留已经写出的文件，不承诺异常后原始归档完整。
+
+消息索引逐条 flush，JS/二进制文件写完后才提交引用它们的消息行。强杀时可能留下未引用文件或最后不完整消息行；没有 closed 状态时不能认定归档结束。这里不提供 fsync 级断电保护。`closed` 只证明已接受记录已写完，设备断连后的缺失采样仍无法恢复。

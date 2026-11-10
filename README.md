@@ -59,7 +59,7 @@ CSV 首列为 **time_ms**，表示统计窗口起点的设备相对时间（毫�
 
 devices 查看连接的设备；counters 查看当前设备实际提供的字段；最后一条保存 JSON 并显示全部指标，仍用 Ctrl+C 结束。
 
-采集只保留四个可选项，通常都可省略：
+采集选项通常都可省略；排查原始数据时才开启 Debug：
 
 | 选项 | 用途 |
 |---|---|
@@ -67,6 +67,15 @@ devices 查看连接的设备；counters 查看当前设备实际提供的字段
 | `--output <路径>` | 指定保存路径，不覆盖旧文件；后缀须匹配格式 |
 | `--format csv\|json` | 默认 CSV；JSON 另含质量统计、指标定义和会话信息 |
 | `--console key\|all\|none` | 终端显示重点、全部或不显示数据；文件始终保存全部指标 |
+| `--debug` | 额外保存设备元数据、JS 和原始采样字节，默认关闭 |
+
+需要查看设备返回的原始数据时运行：
+
+~~~powershell
+.\.venv\Scripts\python.exe ios_gpu_counter.py capture --debug
+~~~
+
+正常结果仍写入 CSV；原始数据额外保存在 `captures/<本次时间戳>/debug/`，包括 `metadata/*.json`、`scripts/*.js`、`samples/*.bin` 和 `messages.jsonl`。即使通过 `--output` 将结果保存到其他位置，Debug 数据仍在 captures 中，实际路径会打印到终端。原始数据可能明显增大磁盘用量，格式和边界见 [Debug 使用说明](docs/USAGE.md#debug-原始数据保存)。
 
 ## GPU Counter 字段说明
 

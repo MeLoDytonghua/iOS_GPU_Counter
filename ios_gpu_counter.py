@@ -131,6 +131,8 @@ def error_guidance(exc):
         return '使用项目 Python 安装依赖 / Install dependencies: .\\.venv\\Scripts\\python.exe -m pip install -r requirements.txt'
     if isinstance(exc, FileExistsError) or "FileExistsError" in message:
         return "输出或 .part 已存在，请换新的 --output；旧数据不会覆盖 / Choose a new output path."
+    if "debug_" in message:
+        return "Debug 原始记录不完整；检查 captures 下的调试目录、磁盘空间和写入权限 / Check debug files, free space and write permissions."
     if isinstance(exc, PermissionError) or "PermissionError" in message:
         return "检查错误中的路径是否可写、是否被 Excel/编辑器占用；换可写 --output / Check path permissions and file locks."
     if "No space left" in message or "Errno 28" in message or "disk full" in message.lower():
@@ -213,6 +215,8 @@ class GpuEventQueue(asyncio.Queue):
 
     @classmethod
     def weight(cls, item):
+        if isinstance(item, NSError):
+            return 64 + cls.weight(item.code) + cls.weight(item.domain) + cls.weight(item.user_info)
         if isinstance(item, (bytes, bytearray)):
             return len(item)
         if isinstance(item, str):
@@ -238,6 +242,213 @@ class GpuEventQueue(asyncio.Queue):
         return item
 
 
+class DebugArchive:
+    """仅在调试子进程写入未经解析的服务载荷。 / Write unparsed service payloads only in the debug child process."""
+    def __init__(self, root, output):
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=False)
+        for name in ("samples", "metadata", "scripts"):
+            (self.root / name).mkdir()
+        self.session = {"schema": "ios_gpu_counter.debug.v1", "state": "recording", "created_at": utc_now(),
+                        "parsed_output": str(Path(output).resolve()), "scope": "decoded_gpu_service_payloads",
+                        "wire_capture": False, "messages": 0, "binary_bytes": 0}
+        self.save_session()
+        self.journal = (self.root / "messages.jsonl").open("x", encoding="utf-8", newline="\n")
+
+    def save_session(self):
+        staged = self.root / "session.tmp"
+        staged.write_text(dumps(self.session), encoding="utf-8")
+        staged.replace(self.root / "session.json")
+
+    def write(self, event, payload, received_at):
+        sequence = self.session["messages"] + 1
+        binaries = 0
+
+        def encode(value):
+            nonlocal binaries
+            if isinstance(value, NSError):
+                return {"$ns_error": encode([value.code, value.domain, value.user_info])}
+            if isinstance(value, (bytes, bytearray)):
+                binaries += 1
+                name = f"samples/{sequence:08d}_{binaries:03d}.bin"
+                data = bytes(value)
+                with (self.root / name).open("xb") as handle:
+                    handle.write(data)
+                self.session["binary_bytes"] += len(data)
+                return {"$binary": {"path": name, "length": len(data), "sha256": hashlib.sha256(data).hexdigest()}}
+            if isinstance(value, dict):
+                # 键和值都编码，保留整数键并避免与标记字典碰撞。 / Encode keys and values to preserve integer keys and avoid tag collisions.
+                return {"$map": [[encode(k), encode(v)] for k, v in value.items()]}
+            if isinstance(value, tuple):
+                return {"$tuple": [encode(v) for v in value]}
+            if isinstance(value, list):
+                return [encode(v) for v in value]
+            if isinstance(value, int) and abs(value) > SAFE_INTEGER:
+                return {"$integer": str(value)}
+            if isinstance(value, float) and not math.isfinite(value):
+                return {"$float": repr(value)}
+            if isinstance(value, datetime):
+                return {"$datetime": value.isoformat()}
+            if value is None or isinstance(value, (str, int, float, bool)):
+                return value
+            raise TypeError(f"unsupported_debug_payload: {type(value).__name__}")
+
+        encoded = encode(payload)
+        metadata_files = []
+
+        def metadata(value, encoded_value):
+            if not isinstance(value, list):
+                return
+            if len(value) >= 5 and value[0] == 0 and isinstance(value[4], (dict, list)):
+                stem = f"{sequence:08d}_{len(metadata_files) + 1:03d}"
+                name = f"metadata/{stem}.json"
+                (self.root / name).write_text(dumps(encoded_value[4]), encoding="utf-8")
+                metadata_files.append(name)
+                body = value[4]
+                source = body.get(2, body.get("2")) if isinstance(body, dict) else None
+                if isinstance(source, str):
+                    # 用二进制写 UTF-8，不改变设备脚本的换行或内容。 / Write UTF-8 bytes without changing script content or newlines.
+                    (self.root / f"scripts/{stem}.js").write_bytes(source.encode("utf-8"))
+            else:
+                for item, encoded_item in zip(value, encoded_value):
+                    metadata(item, encoded_item)
+
+        metadata(payload, encoded)
+        self.journal.write(dumps({"sequence": sequence, "received_at": received_at, "event": event,
+                                  "payload": encoded, "metadata_files": metadata_files}) + "\n")
+        self.journal.flush()
+        self.session["messages"] = sequence
+
+    def close(self, state="closed", error=None):
+        self.journal.close()
+        self.session.update(state=state, ended_at=utc_now())
+        if error:
+            self.session["error"] = error
+        self.save_session()
+
+
+def _debug_worker_main(requests, replies, root, output):
+    """隔离原始文件 I/O，避免阻塞设备事件循环。 / Isolate raw file I/O from the device event loop."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    archive = None
+    try:
+        archive = DebugArchive(root, output)
+        replies.put(("ready", None))
+        while True:
+            item = requests.get()
+            if len(item) == 2 and item[0] == "close":
+                if archive.session["messages"] != item[1]:
+                    raise RuntimeError("debug_message_count_mismatch")
+                archive.close()
+                replies.put(("closed", None))
+                return
+            event, payload, received_at, size = item
+            archive.write(event, payload, received_at)
+            replies.put(("written", size))
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"[:512]
+        replies.put(("error", error))
+        if archive is not None:
+            with contextlib.suppress(Exception):
+                archive.close("failed", error)
+
+
+class DebugRecorder:
+    """有界原始记录队列；失败显式传播，不静默丢失。 / Bound raw recording and propagate failures without silent loss."""
+    def __init__(self, root, output):
+        self.root = Path(root)
+        ctx = multiprocessing.get_context("spawn")
+        self.requests, self.replies = ctx.Queue(maxsize=2048), ctx.Queue()
+        self.requests.cancel_join_thread()
+        self.process = ctx.Process(target=_debug_worker_main,
+                                   args=(self.requests, self.replies, root, output), daemon=True)
+        self.pending_bytes = 0
+        self.record_count = 0
+        self.max_bytes = 64 * 1024 * 1024
+        self.ready = self.finished = self.disposed = False
+        self.failure = None
+        self.process.start()
+
+    def check(self):
+        while True:
+            try:
+                kind, value = self.replies.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "written":
+                self.pending_bytes -= value
+            elif kind == "ready":
+                self.ready = True
+            elif kind == "closed":
+                self.finished = True
+            else:
+                self.failure = "debug_write_failed: " + value
+        if not self.disposed and not self.process.is_alive() and not self.finished:
+            self.failure = self.failure or "debug_worker_exited"
+        if self.failure:
+            raise RuntimeError(self.failure)
+
+    async def start(self, timeout=10):
+        deadline = asyncio.get_running_loop().time() + timeout
+        while not self.ready:
+            self.check()
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError("debug_start_timeout")
+            await asyncio.sleep(.01)
+
+    def record(self, event, payload):
+        self.check()
+        if self.finished or self.disposed:
+            raise RuntimeError("debug_recorder_closed")
+        size = GpuEventQueue.weight(payload)
+        try:
+            if self.pending_bytes + size > self.max_bytes:
+                raise queue.Full
+            self.requests.put_nowait((event, payload, utc_now(), size))
+        except queue.Full:
+            self.failure = "debug_queue_overflow"
+            raise RuntimeError(self.failure) from None
+        self.pending_bytes += size
+        self.record_count += 1
+
+    async def close(self, timeout=5):
+        if self.disposed:
+            return
+        deadline = asyncio.get_running_loop().time() + timeout
+        sent = False
+        try:
+            while not self.finished:
+                self.check()
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError("debug_close_timeout")
+                if not sent:
+                    try:
+                        # 核对接收数，不能把 IPC 序列化丢失误报为完整归档。 / Verify the count so an IPC serialization loss cannot look complete.
+                        self.requests.put_nowait(("close", self.record_count))
+                        sent = True
+                    except queue.Full:
+                        pass
+                await asyncio.sleep(.01)
+        finally:
+            if self.process.is_alive():
+                # 成功确认后也等待进程退出；卡住的写入可被终止。 / Wait for acknowledged exit; terminate a stuck writer if necessary.
+                until = asyncio.get_running_loop().time() + 1
+                while self.process.is_alive() and asyncio.get_running_loop().time() < until:
+                    await asyncio.sleep(.01)
+                if self.process.is_alive():
+                    self.process.terminate()
+                    self.process.join(timeout=.2)
+            if self.process.is_alive():
+                self.process.kill()
+                self.process.join(timeout=.2)
+            if not self.process.is_alive():
+                self.process.join(timeout=0)
+                self.process.close()
+            self.requests.close()
+            self.replies.close()
+            self.disposed = True
+
+
 class GpuService(DTXService):
     IDENTIFIER = GPU_CHANNEL
 
@@ -246,6 +457,7 @@ class GpuService(DTXService):
         self.events = GpuEventQueue()
         self.closed = asyncio.Event()
         self.failure: str | None = None
+        self.debug = None
 
     @dtx_method("requestDeviceGPUInfo")
     async def device_info(self): ...
@@ -264,6 +476,12 @@ class GpuService(DTXService):
     async def flush(self): ...
 
     def enqueue(self, payload):
+        if self.debug is not None:
+            try:
+                self.debug.record("notification", payload)
+            except Exception as exc:
+                self.failure = str(exc)
+                self.closed.set()
         try:
             self.events.put_nowait(payload)
         except asyncio.QueueFull:
@@ -1100,6 +1318,7 @@ async def collect_parsed(service, worker, output, format="csv", stop_event=None,
     progress = CaptureProgress(lambda: worker.statistics)
     progress.phase = "正在启动 / starting"
     progress_task = asyncio.create_task(progress.run())
+    debug = getattr(service, "debug", None)
 
     def failure(stage, exc):
         if len(errors) < 16:
@@ -1111,6 +1330,8 @@ async def collect_parsed(service, worker, output, format="csv", stop_event=None,
     async def rpc(name, operation, can_stop=False):
         try:
             reply = await stage_wait(operation(), budget(), name, stop if can_stop else None)
+            if debug is not None:
+                debug.record("rpc." + name, reply)
             if isinstance(reply, NSError):
                 raise ValueError(f"device_error: {reply.domain}/{reply.code}")
             lifecycle.append({"stage": name, "status": "ok", "samples_processed": worker.statistics["sample_count"]})
@@ -1161,6 +1382,8 @@ async def collect_parsed(service, worker, output, format="csv", stop_event=None,
         print("已启动 GPU Counter，等待设备批次 / GPU started; waiting for device batches", file=sys.stderr, flush=True)
         while True:
             now = loop.time()
+            if debug is not None:
+                debug.check()
             if stop.is_set():
                 reason = "user_stop"
                 break
@@ -1352,7 +1575,11 @@ async def prepare_gpu(args, stack, stop, configure=True, report=None):
     await stage_wait(dvt.connect(), args.timeout, "dvt_connect", stop)
     checked("开发者服务 / developer service", "DVT connected")
     service = await stage_wait(dvt.dtx.open_channel(GpuService), args.timeout, "gpu_channel", stop)
+    debug = getattr(args, "debug_recorder", None)
+    service.debug = debug
     info = await stage_wait(service.device_info(), args.timeout, "gpu_info", stop)
+    if debug is not None:
+        debug.record("rpc.device_info", info)
     candidates = info if isinstance(info, list) else [info]
     if not candidates or any(not isinstance(c, dict) for c in candidates):
         raise ValueError("invalid_gpu_device_info")
@@ -1366,6 +1593,8 @@ async def prepare_gpu(args, stack, stop, configure=True, report=None):
     checked("GPU 能力 / GPU capability", f"{gpu.get('device-name', 'unknown')}, profiles={profiles or 'unknown'}")
     device_info = await stage_wait(stack.enter_async_context(DeviceInfo(dvt)), args.timeout, "timebase_channel", stop)
     mach = await stage_wait(device_info.mach_time_info(), args.timeout, "mach_timebase", stop)
+    if debug is not None:
+        debug.record("rpc.mach_time_info", mach)
     if len(mach) < 3 or int(mach[1]) <= 0 or int(mach[2]) <= 0:
         raise ValueError("invalid_mach_timebase")
     checked("设备时间基准 / timebase", f"{mach[1]}/{mach[2]}")
@@ -1373,6 +1602,8 @@ async def prepare_gpu(args, stack, stop, configure=True, report=None):
         reply = await stage_wait(service.configure(PInt64(gpu["accelerator-id"]), PInt64(args.counter_profile),
                                                    PInt64(args.sampling_interval), PInt64(args.window_limit), PInt32(-1)),
                                  args.timeout, "configure", stop)
+        if debug is not None:
+            debug.record("rpc.configure", reply)
         if isinstance(reply, NSError) or reply is False:
             raise ValueError("gpu_configuration_rejected")
     verified = (model == "iPhone14,2" and provider.product_version == "18.5" and gpu.get("device-name") == "A15"
@@ -1568,16 +1799,26 @@ async def inspection_command(args):
 async def live(args):
     format = getattr(args, "format", "csv")
     preflight_result_path(args.output, format)
+    args.debug_recorder = None
     stack = contextlib.AsyncExitStack()
     worker = None
     handed_off = False
     with sigint_stop_event() as stop:
         try:
+            if getattr(args, "debug", False):
+                root = getattr(args, "debug_directory", None) or (Path("captures") / datetime.now().strftime("%Y%m%d_%H%M%S_%f") / "debug")
+                debug = DebugRecorder(root, args.output)
+                args.debug_recorder = debug
+                stack.push_async_callback(debug.close)
+                await stage_wait(debug.start(args.timeout), args.timeout, "debug_start", stop)
+                print(f"Debug 原始数据 / Raw debug data: {debug.root.resolve()}", file=sys.stderr, flush=True)
             print("正在连接设备 / Connecting to device", file=sys.stderr, flush=True)
             service, mach, device = await prepare_gpu(args, stack, stop)
             print("兼容基线 / Compatibility: " + ("已验证设备 / verified device" if device["compatibility"] == "validated_baseline"
                                                  else "未验证设备 / unverified device"), file=sys.stderr, flush=True)
             header = make_header(int(mach[1]), int(mach[2]), args.report_interval, device)
+            if getattr(args, "debug_recorder", None) is not None:
+                args.debug_recorder.record("session", header)
             worker = CaptureWorker(args.output, header, format, args.console)
             await stage_wait(worker.receive(args.timeout), args.timeout, "worker_start", stop)
             handed_off = True
@@ -1646,6 +1887,8 @@ def build_parser():
     capture.add_argument("--format", choices=("csv", "json"), default="csv", help="文件格式，默认 CSV / output format")
     capture.add_argument("--console", choices=("key", "all", "none"), default="key",
                          help="终端显示重点/全部/不显示数据；文件始终全量 / terminal counter selection")
+    capture.add_argument("--debug", action="store_true",
+                         help="额外在 captures 保存原始元数据、JS 和采样字节 / save raw GPU data under captures")
     for command in (parser, capture, doctor, counters, devices):
         command._positionals.title = "位置参数 / Arguments"
         command._optionals.title = "选项 / Options"
@@ -1661,8 +1904,11 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
     if args.command == "capture":
+        run_directory = Path("captures") / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         if args.output is None:
-            args.output = Path("captures") / datetime.now().strftime("%Y%m%d_%H%M%S_%f") / ("gpu." + args.format)
+            args.output = run_directory / ("gpu." + args.format)
+        if args.debug:
+            args.debug_directory = run_directory / "debug"
         if args.output.suffix.lower() != "." + args.format:
             parser.error("后缀须匹配 --format；JSON 请加 --format json / output suffix must match format")
     try:

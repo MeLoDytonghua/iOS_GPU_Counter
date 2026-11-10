@@ -39,6 +39,34 @@ CSV 后缀应为 .csv，JSON 后缀应为 .json。CSV 使用 UTF-8 BOM 和标准
 
 CSV 的 time_ms 为设备相对窗口起点，单位毫秒；JSON/终端的 start_s、end_s 仍为秒。默认每秒一行，通常对应 0、1000、2000…毫秒。缺失为 CSV 空单元格 / JSON null，正常零值保留。详细定义见 [输出契约](OUTPUT_FORMAT.md)。
 
+## Debug 原始数据保存
+
+```powershell
+.\.venv\Scripts\python.exe ios_gpu_counter.py capture --debug
+.\.venv\Scripts\python.exe ios_gpu_counter.py capture --debug --format json --output result.json
+```
+
+Debug 默认关闭，只能用于 capture。开启后，正常 CSV/JSON 的字段与计算规则不变，额外创建 `captures/<本次时间戳>/debug/`。默认结果与 debug 同在一次运行目录；自定义 `--output` 只改变解析结果的位置，原始文件仍留在 captures，终端会打印路径。
+
+```text
+captures/<本次时间戳>/
+  gpu.csv                       默认解析结果
+  debug/
+    session.json                记录状态与文件统计
+    messages.jsonl              每条收到的载荷及二进制文件索引
+    metadata/00000004_001.json  元数据快照，编号仅为示例
+    scripts/00000004_001.js     对应设备 JS，UTF-8 原内容
+    samples/00000006_001.bin    对应二进制载荷，逐字节保存
+```
+
+保存范围是 pymobiledevice3 解开 DTX 后交给工具的 GPU 服务载荷：GPU 信息、配置/启动/停止/flush 回复、元数据、采样批次、控制通知和未知分发消息，以及初始化 Mach 时间查询结果。采样在拆分、差分、回绕修正和公式计算前保存；不只保存有效样本。停止后取回的尾包也记录。它不是 USB/TCP 抓包，不含原始 DTX 帧头，不录制其他性能服务或配对过程。
+
+JSON 使用类型标记保留整数键、大整数和二进制引用；元数据文件也使用相同编码。直接阅读原文脚本用 scripts 下的 JS，检查采样字节用 samples 下的 bin，通知与回复的关联关系看 messages.jsonl。详细字段见 [Debug 格式](OUTPUT_FORMAT.md#debug-附加文件)。
+
+`session.json.state=closed` 仅表示已接受的原始记录完成写入，不表示本次采集质量为 completed；采集质量仍以正常结果和退出码为准。状态为 recording、failed，或终端出现 debug_* 错误时，不应把原始记录当作完整。强制结束、磁盘写入失败、队列溢出或设备断连都可能留下不完整数据；手机尚未发送的数据无法保存。
+
+Debug 使用额外工作进程和有界队列，会增加 CPU、内存及磁盘消耗，原始数据量通常明显大于秒级结果。写入失败会明确报错并停止正常采集流程，不静默丢失；保留已经完成的原始文件和可用解析结果。无关排查时不要开启。captures 默认被 Git 忽略，不会随代码提交。
+
 ## 终端状态与结束
 
 Counter 数据输出到 stdout，状态、错误和保存路径输出到 stderr，均为 UTF-8 普通文本，不使用 ANSI 控制符。--console key/all/none 只影响数据展示；none 仍会显示状态，文件始终保存全部指标。
