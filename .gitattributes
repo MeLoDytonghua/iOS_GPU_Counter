@@ -1,0 +1,10 @@
+# 文本统一为 LF，Windows Python 与 PowerShell 均可读取。 / Normalize text to LF, readable by Windows Python and PowerShell.
+* text=auto
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.csv text eol=lf
+LICENSE text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf

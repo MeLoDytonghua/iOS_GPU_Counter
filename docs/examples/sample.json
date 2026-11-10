@@ -1,0 +1,89 @@
+{
+  "schema": "ios_gpu_counter.rows.v2",
+  "aggregation": "arithmetic_mean_of_valid_samples",
+  "device": {
+    "model": "Synthetic example",
+    "compatibility": "synthetic"
+  },
+  "scope": "device",
+  "source": "synthetic_example",
+  "started_at": "2026-01-01T00:00:00+00:00",
+  "report_interval": 1.0,
+  "counters": [
+    {
+      "name": "ALU Utilization",
+      "unit": "%",
+      "description": "测试 / Test"
+    },
+    {
+      "name": "Other",
+      "unit": null,
+      "description": ""
+    }
+  ],
+  "rows": [
+    {
+      "start_s": 0.0,
+      "end_s": 1.0,
+      "partial_window": false,
+      "sample_count": 3,
+      "status": "partial",
+      "baseline_count": 1,
+      "duplicate_count": 0,
+      "invalid_sample_count": 1,
+      "adjusted_sample_count": 1,
+      "valid_counts": {
+        "ALU Utilization": 2,
+        "Other": 1
+      },
+      "values": {
+        "ALU Utilization": 1.0,
+        "Other": 8.0
+      }
+    },
+    {
+      "start_s": 1.0,
+      "end_s": 2.0,
+      "partial_window": false,
+      "sample_count": 0,
+      "status": "missing",
+      "baseline_count": 0,
+      "duplicate_count": 0,
+      "invalid_sample_count": 0,
+      "adjusted_sample_count": 0,
+      "valid_counts": {
+        "ALU Utilization": 0,
+        "Other": 0
+      },
+      "values": {
+        "ALU Utilization": null,
+        "Other": null
+      }
+    },
+    {
+      "start_s": 2.0,
+      "end_s": 2.25,
+      "partial_window": true,
+      "sample_count": 1,
+      "status": "valid",
+      "baseline_count": 0,
+      "duplicate_count": 0,
+      "invalid_sample_count": 0,
+      "adjusted_sample_count": 0,
+      "valid_counts": {
+        "ALU Utilization": 1,
+        "Other": 1
+      },
+      "values": {
+        "ALU Utilization": 3.0,
+        "Other": 9.0
+      }
+    }
+  ],
+  "result": {
+    "status": "partial",
+    "stop_reason": "synthetic_example",
+    "row_count": 3,
+    "ended_at": "2026-01-01T00:00:02.250000+00:00"
+  }
+}

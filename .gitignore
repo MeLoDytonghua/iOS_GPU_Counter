@@ -1,0 +1,25 @@
+# 默认仅发布明确列出的用户文件。 / Publish only explicitly listed user-facing files.
+/*
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/LICENSE
+!/THIRD_PARTY_NOTICES.md
+!/ios_gpu_counter.py
+!/requirements.txt
+!/docs/
+/docs/*
+!/docs/USAGE.md
+!/docs/OUTPUT_FORMAT.md
+!/docs/TECHNICAL_GUIDE.md
+!/docs/examples/
+/docs/examples/*
+!/docs/examples/sample.csv
+!/docs/examples/sample.json
+!/tools/
+/tools/*
+!/tools/recover_results.py
+
+# 避免嵌套缓存被意外加入。 / Keep nested interpreter caches out of version control.
+__pycache__/
+*.py[cod]
