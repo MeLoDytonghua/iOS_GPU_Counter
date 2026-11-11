@@ -23,7 +23,6 @@ import signal
 import struct
 import sys
 import tempfile
-import time
 from datetime import datetime, timezone
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -55,6 +54,8 @@ except (ImportError, OSError) as exc:
 
 GPU_CHANNEL = "com.apple.instruments.server.services.gpu"
 SAFE_INTEGER = 2**53 - 1
+# 协议上下文字段直接取当前值，不按普通累计计数器求差分。
+# Protocol context fields use the current value rather than an ordinary accumulator delta.
 SPECIAL_FIELDS = {
     "GRC_TIMESTAMP", "GRC_GPU_CYCLES", "GRC_ENCODER_ID",
     "GRC_KICK_TRACE_ID", "GRC_SAMPLE_TYPE",
@@ -65,13 +66,19 @@ KEY_COUNTERS = {
 }
 
 
+# 阅读入口：main → live → prepare_gpu → collect_parsed → ParsedPipeline → Decoder。
+# Reading route: main → live → prepare_gpu → collect_parsed → ParsedPipeline → Decoder.
+# 主进程通信；解析子进程持有 QuickJS/结果文件；可选 Debug 子进程保存原始载荷。
+# The parent owns transport; one child owns QuickJS/results; an optional debug child archives raw payloads.
+
+# 1. 公共序列化与错误提示 / Shared serialization and error messages
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
 def json_safe(value: Any) -> Any:
-    """无损表示解码后的 DTX 负载，不包含原始 DTX 帧。
-    Lossless JSON representation of decoded DTX payloads (not raw DTX frames).
+    """将元数据转成可计算指纹的 JSON 值；完整原始类型由 DebugArchive 保留。
+    Convert metadata to JSON values for fingerprinting; DebugArchive preserves original types.
     """
     if isinstance(value, NSError):
         return {"$ns_error": {"code": value.code, "domain": value.domain,
@@ -84,21 +91,6 @@ def json_safe(value: Any) -> Any:
         return [json_safe(v) for v in value]
     if isinstance(value, dict):
         return {str(k): json_safe(v) for k, v in value.items()}
-    return value
-
-
-def from_json(value: Any) -> Any:
-    if isinstance(value, dict):
-        if set(value) == {"$ns_error"}:
-            error = value["$ns_error"]
-            return NSError(error["code"], error["domain"], from_json(error["user_info"]))
-        if set(value) == {"$bytes"}:
-            return base64.b64decode(value["$bytes"], validate=True)
-        if set(value) == {"$integer"}:
-            return int(value["$integer"])
-        return {k: from_json(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [from_json(v) for v in value]
     return value
 
 
@@ -119,8 +111,6 @@ def error_guidance(exc):
     phase = getattr(exc, "gpu_stage", "")
     if "unsupported_python" in message:
         return "使用 Python 3.12 创建 .venv，再安装 requirements.txt / Create a Python 3.12 virtual environment."
-    if "parsed_result_not_legacy_replay" in message:
-        return "这是解析结果，不含回放所需原始数据；.part 恢复用 tools/recover_results.py / Parsed results are not legacy replay input."
     if "csv_time_column_conflict" in message:
         return "设备指标名与 CSV 的 time_ms 列冲突，请使用 --format json / Use JSON to preserve the conflicting counter name."
     if isinstance(exc, ImportError) or "PackageNotFoundError" in name:
@@ -168,6 +158,7 @@ def print_error(exc):
     print("下一步 / Next: " + error_guidance(exc), file=sys.stderr)
 
 
+# 2. 主进程进度与有界接收队列 / Parent-side progress and bounded receive queue
 class CaptureProgress:
     """只在等待状态切换及数据到达时提示，不定时刷新。
     Report waiting transitions and incoming data only, without periodic refresh.
@@ -232,6 +223,7 @@ class GpuEventQueue(asyncio.Queue):
         return item
 
 
+# 3. 可选 Debug：接收原始载荷，独立进程写盘 / Optional debug: archive raw payloads in a separate process
 class DebugArchive:
     """仅在调试子进程写入未经解析的服务载荷。 / Write unparsed service payloads only in the debug child process."""
     def __init__(self, root, output):
@@ -251,6 +243,9 @@ class DebugArchive:
         staged.replace(self.root / "session.json")
 
     def write(self, event, payload, received_at):
+        """先保存二进制/脚本，再提交引用它们的消息行。
+        Write binary/script files before committing the message line that references them.
+        """
         sequence = self.session["messages"] + 1
         binaries = 0
 
@@ -387,6 +382,9 @@ class DebugRecorder:
             await asyncio.sleep(.01)
 
     def record(self, event, payload):
+        """只入队不执行文件 I/O；确认回执释放已排队的字节预算。
+        Enqueue without file I/O; write acknowledgments release the queued byte budget.
+        """
         self.check()
         if self.finished or self.disposed:
             raise RuntimeError("debug_recorder_closed")
@@ -439,7 +437,11 @@ class DebugRecorder:
             self.disposed = True
 
 
+# 4. GPU 服务接口：库负责 DTX 编解码，本类只声明业务方法 / GPU API: the library owns DTX encoding; this class declares methods
 class GpuService(DTXService):
+    """RPC 的 await 返回对应回复；采样通过 notification 独立到达。
+    Each awaited RPC returns its reply; sample notifications arrive independently.
+    """
     IDENTIFIER = GPU_CHANNEL
 
     def __init__(self, ctx):
@@ -494,6 +496,7 @@ class GpuService(DTXService):
         self.closed.set()
 
 
+# 5. 从样本字节到指标值 / From sample bytes to metric values
 class FormulaEngine:
     """仅在采集管线的专用工作线程中创建和使用。
     Created and used only on the pipeline's dedicated worker thread.
@@ -525,6 +528,9 @@ class FormulaEngine:
         self.functions = [c[3] for c in counters]
 
     def evaluate(self, values, interval_ns, previous_ns):
+        """注入本样本变量并调用元数据指定的函数；不自行推导指标公式。
+        Inject this sample's inputs and call metadata-selected functions without inventing metric formulas.
+        """
         values = dict(values)
         values.update(MTLStat_nSec=interval_ns, SAMPLE_INTERVAL_USEC=interval_ns / 1000,
                       _LastTimestamp=previous_ns)
@@ -532,6 +538,9 @@ class FormulaEngine:
 
 
 class Decoder:
+    """跨包保存前值：元数据绑定字段，samples 解包，再准备输入和执行公式。
+    Retain previous records across packets: metadata binds fields, samples unpacks, then inputs and formulas run.
+    """
     def __init__(self, numer: int, denom: int):
         if numer <= 0 or denom <= 0:
             raise ValueError("invalid Mach timebase")
@@ -545,6 +554,9 @@ class Decoder:
         self.origin = None
 
     def metadata(self, payload):
+        """0=显示定义，1=原始字段，2=JS，3=GPU 参数；公式指纹只用于记录。
+        Keys 0/1/2/3 hold display definitions/raw fields/JS/GPU parameters; the formula hash is informational only.
+        """
         self.version += 1
         self.previous = None
         self.engine = None
@@ -585,6 +597,9 @@ class Decoder:
                 "units": {name: None for name in names}}
 
     def samples(self, count, data):
+        """每条记录为 timestamp + N 个 uint64；先校验布局，再逐条生成结果。
+        Each record is timestamp plus N uint64 values; validate its layout before yielding per-sample results.
+        """
         if self.counters is None:
             raise ValueError("samples_before_metadata")
         fields = self.raw_fields if self.raw_fields is not None else self.counters
@@ -627,69 +642,86 @@ class Decoder:
                 sample["status"] = error
                 yield sample
                 continue
-            values = {}
-            for i, (name, instantaneous, *_) in enumerate(fields):
-                value = raw[i]
-                if name not in SPECIAL_FIELDS and not instantaneous:
-                    value -= previous[i + 1]
-                    if value < 0:
-                        # 不猜测计数位宽或回绕原因，所有设备统一跳过该样本。
-                        # Never guess counter width or the cause of a decrease; skip this sample on every device.
-                        error = "counter_reset_or_wrap"
-                        sample["errors"][name] = "counter_decreased"
-                # 仅当公式引用绝对时间戳时，才需要将其传入 JS。
-                # Absolute timestamp does not need to enter JS unless referenced by formula.
-                values[name.replace(" ", "_").replace(":", "_")] = value
-            if any(abs(v) > SAFE_INTEGER for v in values.values()):
-                error = error or "unsafe_javascript_integer"
-            if error:
-                sample["status"] = error
-                yield sample
-                continue
-            cycles = values.get("GRC_GPU_CYCLES")
-            if cycles is None or cycles <= 0:
-                sample["status"] = "missing_or_zero_gpu_cycles"
-                yield sample
-                continue
-            values.update({k + "_norm": v / cycles for k, v in list(values.items())})
-            try:
-                if self.engine is None:
-                    raise ValueError(self.engine_error or "formula engine unavailable")
-                # 保留设备的绝对纳秒时间，以兼容设备公式。
-                # Absolute device nanoseconds are retained for device formula compatibility.
-                previous_ns = previous[0] * self.numer / self.denom
-                if abs(previous_ns) > SAFE_INTEGER:
-                    raise ValueError("unsafe_javascript_previous_timestamp")
-                results = self.engine.evaluate(values, sample["interval_ns"], previous_ns)
-                for counter, result in zip(self.counters, results):
-                    name, maximum, _, _, scale, *_ = counter
-                    value = result["value"]
-                    sample["formula_values"][name] = value
-                    if result["error"]:
-                        sample["values"][name] = None
-                        sample["errors"][name] = result["error"]
-                        continue
-                    try:
-                        displayed = value * scale
-                        if not math.isfinite(displayed):
-                            raise ValueError("non_finite_scaled_value")
-                        sample["values"][name] = min(max(displayed, 0), maximum)
-                    except (ValueError, TypeError, OverflowError) as exc:
-                        sample["values"][name] = None
-                        sample["errors"][name] = str(exc)
-            except Exception as exc:
-                # 上下文超时或损坏后，避免每个样本都重复阻塞一秒。
-                # A timed-out or broken context must not repeat a one-second stall per sample.
-                if self.engine is not None:
-                    self.engine_error = f"formula_execution_disabled: {exc}"
-                    self.engine = None
-                error_message = self.engine_error or str(exc)
-                sample["values"] = {c[0]: None for c in self.counters}
-                sample["errors"] = {c[0]: error_message for c in self.counters}
-            sample["status"] = "invalid" if sample["errors"] else "valid"
+            values = self._prepare_formula_inputs(raw, previous, sample)
+            if values is not None:
+                self._evaluate_counters(values, previous[0], sample)
             yield sample
 
+    def _prepare_formula_inputs(self, raw, previous, sample):
+        """按字段定义差分并生成 _norm；异常时标记样本并返回 None。
+        Difference fields and generate _norm inputs; mark invalid samples and return None.
+        """
+        error = None
+        values = {}
+        for i, (name, instantaneous, *_) in enumerate(self.raw_fields):
+            value = raw[i]
+            if name not in SPECIAL_FIELDS and not instantaneous:
+                # previous 是完整记录，字段下标比 raw 多一个时间戳位置。 / previous includes the timestamp, so its field index is offset by one.
+                value -= previous[i + 1]
+                if value < 0:
+                    # 不猜测计数位宽或回绕原因，所有设备统一跳过该样本。
+                    # Never guess counter width or the cause of a decrease; skip this sample on every device.
+                    error = "counter_reset_or_wrap"
+                    sample["errors"][name] = "counter_decreased"
+            # 使用元数据名称建立 JS 变量；raw 不包含记录开头的时间戳。
+            # Build JS variables from metadata names; raw excludes the leading record timestamp.
+            values[name.replace(" ", "_").replace(":", "_")] = value
+        if any(abs(v) > SAFE_INTEGER for v in values.values()):
+            error = error or "unsafe_javascript_integer"
+        if error:
+            sample["status"] = error
+            return None
+        cycles = values.get("GRC_GPU_CYCLES")
+        if cycles is None or cycles <= 0:
+            sample["status"] = "missing_or_zero_gpu_cycles"
+            return None
+        # 同时保留原值/差分值与每周期归一化值，由设备 JS 选择。
+        # Keep both raw/delta and per-cycle normalized values for the device JS to choose.
+        values.update({k + "_norm": v / cycles for k, v in list(values.items())})
+        return values
 
+    def _evaluate_counters(self, values, previous_timestamp, sample):
+        """调用设备公式并按设备 scale/maximum 显示，不加入机型公式。
+        Call device formulas and apply their scale/maximum without model-specific formulas.
+        """
+        try:
+            if self.engine is None:
+                raise ValueError(self.engine_error or "formula engine unavailable")
+            # 保留设备的绝对纳秒时间，以兼容设备公式。
+            # Absolute device nanoseconds are retained for device formula compatibility.
+            previous_ns = previous_timestamp * self.numer / self.denom
+            if abs(previous_ns) > SAFE_INTEGER:
+                raise ValueError("unsafe_javascript_previous_timestamp")
+            results = self.engine.evaluate(values, sample["interval_ns"], previous_ns)
+            for counter, result in zip(self.counters, results):
+                name, maximum, _, _, scale, *_ = counter
+                value = result["value"]
+                sample["formula_values"][name] = value
+                if result["error"]:
+                    sample["values"][name] = None
+                    sample["errors"][name] = result["error"]
+                    continue
+                try:
+                    displayed = value * scale
+                    if not math.isfinite(displayed):
+                        raise ValueError("non_finite_scaled_value")
+                    sample["values"][name] = min(max(displayed, 0), maximum)
+                except (ValueError, TypeError, OverflowError) as exc:
+                    sample["values"][name] = None
+                    sample["errors"][name] = str(exc)
+        except Exception as exc:
+            # 上下文超时或损坏后，避免每个样本都重复阻塞一秒。
+            # A timed-out or broken context must not repeat a one-second stall per sample.
+            if self.engine is not None:
+                self.engine_error = f"formula_execution_disabled: {exc}"
+                self.engine = None
+            error_message = self.engine_error or str(exc)
+            sample["values"] = {c[0]: None for c in self.counters}
+            sample["errors"] = {c[0]: error_message for c in self.counters}
+        sample["status"] = "invalid" if sample["errors"] else "valid"
+
+
+# 6. 窗口与输出：共享一份 WindowRecord，文件与终端不各自重算 / Windows and output share one WindowRecord without recalculation
 RESULT_SCHEMA = "ios_gpu_counter.rows.v2"
 AGGREGATION = "arithmetic_mean_of_valid_samples"
 
@@ -1031,6 +1063,8 @@ class ParsedPipeline:
             return
         if not isinstance(payload, list) or len(payload) < 5:
             raise ValueError("unsupported_gpu_payload")
+        # 这里只解释库解码后的 GPU 载荷，未知布局不能猜测后继续。
+        # Interpret GPU payloads after library decoding; never guess an unknown layout and continue.
         kind, _, _, count, body = payload[:5]
         if kind == 0:
             signature = hashlib.sha256(dumps(json_safe(body)).encode()).hexdigest()
@@ -1116,6 +1150,7 @@ def recover_result_json(source, output):
             writer.close()
 
 
+# 7. 停止事件、超时与解析工作进程 / Stop events, timeouts and the parsing worker process
 @dataclass
 class RunResult:
     path: Path | None
@@ -1124,12 +1159,14 @@ class RunResult:
 
 
 def make_header(numer=1, denom=1, report_interval=1.0, device=None, source="device"):
+    """创建内部会话配置；ResultWriter 仅导出公开格式允许的字段。
+    Build internal session configuration; ResultWriter exports only public-format fields.
+    """
     return {"schema_version": 1, "timebase": {"numer": numer, "denom": denom},
             "device": dict(device or {}, scope="device"),
             "session": {"started_at": utc_now(), "report_interval": report_interval,
                         "source": source, "dependencies": {
-                            p: importlib.metadata.version(p) for p in ("pymobiledevice3", "quickjs-ng")}},
-            "validation": "GPU-only path validated on iPhone 13 Pro / iOS 18.5; other devices require validation"}
+                            p: importlib.metadata.version(p) for p in ("pymobiledevice3", "quickjs-ng")}}}
 
 
 @contextlib.contextmanager
@@ -1184,8 +1221,8 @@ async def stage_wait(awaitable, timeout, stage, stop=None):
 
 
 def _capture_worker_main(requests, replies, output, header, format, console):
-    """子进程内唯一线程拥有 QuickJS 与文件；IPC 不写原始数据。
-    One child thread owns QuickJS and files; IPC never persists raw data.
+    """解析子进程单线程持有 QuickJS 与结果文件；原始记录由独立 Debug 进程负责。
+    One parsing-child thread owns QuickJS/results; a separate debug process owns raw recording.
     """
     # Windows Ctrl+C 会广播到同控制台子进程，必须由父进程独占处理并安排保存。
     # Windows broadcasts Ctrl+C to console children; only the parent may handle it and coordinate saving.
@@ -1305,6 +1342,7 @@ def processing_chunks(payload, limit=512):
         yield chunk
 
 
+# 8. 采集生命周期：启动 → 消费 → 停止/排空/取尾 → 完成文件 / Capture lifecycle: start → consume → stop/drain/flush → finalize
 async def collect_parsed(service, worker, output, format="csv", stop_event=None,
                          timeout=10, idle_timeout=30, drain_timeout=2, shutdown_timeout=25,
                          cleanup=None, on_started=None):
@@ -1342,6 +1380,9 @@ async def collect_parsed(service, worker, output, format="csv", stop_event=None,
             raise
 
     async def process(payload, interruptible=False, announce=True):
+        """整批消息仅提示一次，按子批等待工作进程；中断时保留尚未处理部分。
+        Announce once per packet and await worker chunks; retain the unprocessed remainder on interruption.
+        """
         nonlocal processing_ok, pending_chunks
         if not processing_ok:
             return
@@ -1414,6 +1455,8 @@ async def collect_parsed(service, worker, output, format="csv", stop_event=None,
         reason = "capture_error"
         failure("capture", exc)
     finally:
+        # 不论用户停止还是采集错误，都尝试相同的有界收尾；错误累计后影响最终状态。
+        # User stop and capture errors share bounded cleanup; accumulated errors affect final status.
         elapsed = loop.time() - started
         shutdown_started = loop.time()
         shutdown_deadline = shutdown_started + shutdown_timeout
@@ -1485,6 +1528,7 @@ async def collect_parsed(service, worker, output, format="csv", stop_event=None,
         return result
 
 
+# 9. 设备连接与初始化：只编排库接口 / Device connection and initialization: orchestrate library APIs only
 @contextlib.asynccontextmanager
 async def connect_device(args):
     """仅对上游公开 API 做轻量编排，此处不实现传输协议。
@@ -1492,43 +1536,31 @@ async def connect_device(args):
     """
     ensure_transport()
     from pymobiledevice3.lockdown import create_using_usbmux
-    from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
     from pymobiledevice3.remote.rsd_tunnel import PreferredRsdTunnel
-    from pymobiledevice3.tunneld.api import get_tunneld_devices
     from pymobiledevice3 import usbmux
 
     async with contextlib.AsyncExitStack() as stack:
-        if args.rsd:
-            provider = await stack.enter_async_context(RemoteServiceDiscoveryService((args.rsd[0], int(args.rsd[1]))))
-        elif args.tunnel:
-            providers = await get_tunneld_devices()
-            for candidate in providers:
-                stack.push_async_callback(candidate.close)
-            selected = [p for p in providers if not args.udid or p.udid == args.udid]
-            if len(selected) != 1:
-                raise ValueError("no_device_in_tunneld" if not selected else
-                                 "multiple_devices: " + ", ".join(p.udid for p in selected))
-            provider = selected[0]
+        # 显式 UDID 优先；没有选择时只接受唯一 USB 设备。 / Prefer an explicit UDID; otherwise require exactly one USB device.
+        serial = args.udid
+        if not serial:
+            devices = await usbmux.select_devices_by_connection_type(connection_type="USB")
+            if len(devices) != 1:
+                raise ValueError("no_device_connected" if not devices else
+                                 "multiple_devices: " + ", ".join(d.serial for d in devices))
+            serial = devices[0].serial
+        kwargs = {"serial": serial}
+        if getattr(args, "command", None) == "doctor":
+            kwargs["autopair"] = False
+        lockdown = await stack.enter_async_context(await create_using_usbmux(**kwargs))
+        if getattr(lockdown, "paired", True) is False:
+            raise ValueError("trust_required")
+
+        # 版本决定传输入口，协议细节交给库；这不是指标数值特判。
+        # OS version selects the transport; the library owns protocol details, not metric corrections.
+        if int(lockdown.product_version.split(".")[0]) >= 17:
+            provider = await stack.enter_async_context(PreferredRsdTunnel(serial=serial))
         else:
-            serial = args.udid
-            if not serial:
-                devices = await usbmux.select_devices_by_connection_type(connection_type="USB")
-                if len(devices) != 1:
-                    raise ValueError("no_device_connected" if not devices else
-                                     "multiple_devices: " + ", ".join(d.serial for d in devices))
-                serial = devices[0].serial
-            kwargs = {"serial": serial}
-            if getattr(args, "command", None) == "doctor":
-                kwargs["autopair"] = False
-            lockdown = await stack.enter_async_context(await create_using_usbmux(**kwargs))
-            if getattr(lockdown, "paired", True) is False:
-                raise ValueError("trust_required")
-            if int(lockdown.product_version.split(".")[0]) >= 17:
-                # Windows 上旧版 iOS 的隧道前置准备由 pymobiledevice3 CLI 管理。
-                # Older Windows tunnel prerequisites are managed by pymobiledevice3 CLI.
-                provider = await stack.enter_async_context(PreferredRsdTunnel(serial=serial))
-            else:
-                provider = lockdown
+            provider = lockdown
         if args.udid and provider.udid != args.udid:
             raise ValueError("selected_device_mismatch")
         yield provider
@@ -1578,10 +1610,9 @@ async def prepare_gpu(args, stack, stop, configure=True, report=None):
     candidates = info if isinstance(info, list) else [info]
     if not candidates or any(not isinstance(c, dict) for c in candidates):
         raise ValueError("invalid_gpu_device_info")
-    selected = [c for c in candidates if args.accelerator_id is None or c.get("accelerator-id") == args.accelerator_id]
-    if len(selected) != 1:
+    if len(candidates) != 1:
         raise ValueError("multiple_gpu_candidates: " + ", ".join(str(c.get("accelerator-id")) for c in candidates))
-    gpu = selected[0]
+    gpu = candidates[0]
     profiles = gpu.get("supported-counter-profiles")
     if profiles is not None and args.counter_profile not in profiles:
         raise ValueError(f"unsupported_counter_profile: requested={args.counter_profile}, supported={profiles}")
@@ -1601,6 +1632,8 @@ async def prepare_gpu(args, stack, stop, configure=True, report=None):
             debug.record("rpc.configure", reply)
         if isinstance(reply, NSError) or reply is False:
             raise ValueError("gpu_configuration_rejected")
+    # 仅标注既有验收范围，不选择公式、不修正数值，也不拒绝其他设备。
+    # Label prior acceptance scope only; never select formulas, correct values or reject other devices here.
     verified = (model == "iPhone14,2" and provider.product_version == "18.5" and gpu.get("device-name") == "A15"
                 and args.counter_profile == 3 and args.sampling_interval == 0 and args.window_limit == -1)
     device = {"model": model, "ios_version": provider.product_version, "gpu_name": gpu.get("device-name"),
@@ -1615,6 +1648,7 @@ async def prepare_gpu(args, stack, stop, configure=True, report=None):
     return service, mach, device
 
 
+# 10. 用户命令与程序入口 / User commands and program entrypoint
 def local_checks():
     """只读依赖诊断，使用当前解释器，不安装组件。 / Read-only checks of the active interpreter, without installation."""
     checks = [("Python", "ok" if sys.version_info[:2] == (3, 12) else "warning" if sys.version_info[:2] > (3, 12)
@@ -1652,8 +1686,6 @@ async def devices_command(args):
     with sigint_stop_event() as stop:
         devices = await stage_wait(usbmux.list_devices(), args.timeout, "usbmux_list", stop)
         for device in devices:
-            if args.connection != "all" and device.connection_type != args.connection:
-                continue
             info = {"udid": device.serial, "connection": device.connection_type,
                     "name": "unknown", "model": "unknown", "ios": "unknown", "state": "unknown"}
             lockdown = None
@@ -1792,6 +1824,9 @@ async def inspection_command(args):
 
 
 async def live(args):
+    """先验证输出，再初始化设备/工作进程，最后把收尾责任交给采集循环。
+    Validate output, initialize device/workers, then transfer cleanup ownership to the collection loop.
+    """
     format = getattr(args, "format", "csv")
     preflight_result_path(args.output, format)
     args.debug_recorder = None
@@ -1816,6 +1851,8 @@ async def live(args):
                 args.debug_recorder.record("session", header)
             worker = CaptureWorker(args.output, header, format, args.console)
             await stage_wait(worker.receive(args.timeout), args.timeout, "worker_start", stop)
+            # 交接前的失败由 finally 清理；交接后由 collect_parsed 负责所有收尾。
+            # finally handles pre-handoff failures; collect_parsed owns all cleanup after handoff.
             handed_off = True
             return await collect_parsed(service, worker, args.output, format, stop_event=stop, timeout=args.timeout,
                                         idle_timeout=getattr(args, "idle_timeout", 30),
@@ -1865,8 +1902,7 @@ def build_parser():
     # 内部固定策略不是命令行选项；不向操作者暴露协议参数或定时录制。
     # Fixed runtime policy is not a CLI option; operators do not configure protocol details or timed capture.
     parser.set_defaults(timeout=10, connect_timeout=30, shutdown_timeout=25, idle_timeout=30,
-                        report_interval=1, counter_profile=3, sampling_interval=0, window_limit=-1,
-                        tunnel=False, rsd=None, accelerator_id=None, connection="all")
+                        report_interval=1, counter_profile=3, sampling_interval=0, window_limit=-1)
     sub = parser.add_subparsers(dest="command", required=True, title="命令 / Commands")
     capture = sub.add_parser("capture", allow_abbrev=False,
                              help="持续采集，Ctrl+C 结束并保存 / capture until Ctrl+C")

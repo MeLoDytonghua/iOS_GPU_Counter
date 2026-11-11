@@ -1,252 +1,294 @@
-# iOS GPU Counter 采集技术说明与游戏性能排查指南
+# 从零理解 iOS GPU Counter：通信、计算与结果
 
-更新：2026-11-10。实现基线：Windows x64、Python 3.12、pymobiledevice3 11.39.0、quickjs-ng 0.18.0.1；现场验证设备为 iPhone 13 Pro / A15 / iOS 18.5。
+本文说明工具如何工作，不需要先了解 DTX、GPU 计数器或异步编程。所有演算例子都是**合成数据**，只用于解释协议和代码；没有把某个设备的字段、时钟或核心数量作为通用公式。
 
-本文按“指标是什么 → 从哪里获取 → 如何计算 → 如何实现 → 如何用于排查”展开。
+运行方法见 [README](../README.md)，错误处理与 Debug 用法见 [USAGE](USAGE.md)，完整文件定义见 [OUTPUT_FORMAT](OUTPUT_FORMAT.md)。
 
-工具负责采集和导出数据；本文介绍人如何解读这些数据，不表示工具新增了自动分析、图表或瓶颈判定功能。
+建议先顺序读 1～5 节，建立“连接 → 原始值 → 指标 → 文件”的完整认识；6～8 节按指标或游戏问题查阅；第 9 节提供源码阅读路线。
 
-## 阅读路线
+## 1. 先看完整流程
 
-| 想了解的问题 | 建议阅读 |
-|---|---|
-| 这些数据能帮我做什么？ | 第 1–2 节：能力与概念 |
-| Windows 如何读到 iPhone 的 Counter？ | 第 3 节：设备通信与协议 |
-| CSV 中一个数字是怎么算出来的？ | 第 4–5 节：解码、公式与聚合 |
-| 30 个字段分别有什么用？ | 第 6 节：逐项指标说明 |
-| 掉帧、特效、材质和带宽问题如何排查？ | 第 7–8 节：场景与验证流程 |
-| 如何继续维护代码、判断结果可信度？ | 第 9–10 节：可靠性与源码导航 |
-
-使用命令见 [README](../README.md)，文件契约见 [OUTPUT_FORMAT](OUTPUT_FORMAT.md)，兼容范围与已知限制见 [使用说明](USAGE.md#兼容性与已知限制)。
-
-## 1. 工具提供的是什么
-
-游戏一帧变慢，可能发生在 CPU 提交、顶点处理、像素着色、纹理访问或内存读写等不同环节。GPU Counter 提供 GPU 内部不同工作路径的活动线索，帮助缩小调查范围。
-
-例如，开启某个后处理后，外部帧时间明显变长，同时纹理采样和读带宽指标持续升高，可以优先检查该后处理的采样次数和输入资源。这里得到的是“值得验证的方向”，不是自动证明某个 Shader 有问题。
-
-本工具输出有四个重要属性：
-
-1. **全设备范围**：包含采样期间设备 GPU 上的工作，不按游戏 PID、渲染 Pass 或 Draw Call 归因。后台图形活动、系统合成也可能影响结果。
-2. **设备动态定义**：名称、原始字段、公式来自设备。当前基线返回 30 个指标，但代码没有把 30 写死为通用字段数量。
-3. **一秒一个统计窗口**：每项取窗口内有效样本的算术平均。它适合观察持续变化，不能保留单帧或几毫秒尖峰的完整形状。
-4. **设备分批推送**：设备时间和主机收到数据的时间不同。一秒一行不等于主机每秒准时收到一行。
-
-| 可以帮助缩小范围 | 仅凭本工具不能回答 |
-|---|---|
-| 变化主要伴随算术、纹理、Buffer 还是外部内存访问？ | 哪一个 Draw Call、哪一行 Shader 消耗了多少毫秒？ |
-| Vertex、Fragment、Compute 哪类并发活动变化明显？ | 目标游戏独占了多少 GPU 使用率？ |
-| 某功能开关后，GPU 工作特征是否变化？ | FPS、逐帧 GPU 时间、Draw Call 数、三角形数是多少？ |
-| 持续负载下是否出现读写压力或计算效率的可疑变化？ | 是否发生 CPU 卡顿、显存泄漏、降频或功耗异常？ |
-
-右列需要配合游戏自身统计、引擎 Profiler、Instruments 或 Xcode Metal 调试信息。本工具不为补齐这些数据而启动其他性能采样器。
-
-## 2. 先理解几组容易混淆的概念
-
-### 2.1 工作阶段与执行资源
-
-Vertex Shader 处理顶点；Fragment Shader 处理光栅化产生的片元；Compute Kernel 执行通用并行任务。ALU、纹理路径、Buffer 路径和缓存是执行这些工作的资源，不能与三个 Shader 阶段一一对应：顶点和计算任务同样可能读取纹理，片元任务也可能读取 Buffer。
-
-Apple GPU 使用基于 Tile 的渲染架构，存在片上存储和多级缓存；GPU 访问纹理或 Buffer 不意味着每次都访问外部内存。因此“纹理活动高”和“外部读带宽高”是两个不同观察。架构背景见 Apple 的 [GPU Counter 介绍](https://developer.apple.com/videos/play/wwdc2020/10603/)。
-
-### 2.2 Limiter、Utilization 与 Occupancy
-
-| 类别 | 回答什么 | 不代表什么 |
-|---|---|---|
-| **Utilization，利用程度** | 某条执行路径实际做了多少工作，相对它的能力如何？ | 全 GPU 的统一忙碌率；也不是该路径在所有指令中的占比 |
-| **Limiter，限制相关活动** | 哪条路径的工作及停顿可能限制推进？ | 每个值都是独立的帧耗时比例；最高值必然是唯一根因 |
-| **Occupancy，并发占用程度** | 活跃 SIMD 组相对可同时运行的最大容量如何？ | 显存占用、GPU 时间、帧率或算术吞吐效率 |
-| **Bandwidth，带宽** | 单位时间读写 GPU 外部内存的量如何？ | 已分配资源大小、显存占用或整机总内存带宽 |
-| **Count，计数** | 设备定义的某类事件量 | 本工具导出时自动变成“每秒总次数” |
-
-Apple 对 Limiter 与 Utilization 的通用解释区分了包含停顿的活动与实际执行工作。二者差距可以提示效率问题，但本工具经过设备公式、缩放、限幅和秒级均值，**不能把导出的 Limiter 减 Utilization，直接命名为精确的 stall 时间**。参见 [Reducing shader bottlenecks](https://developer.apple.com/documentation/xcode/reducing-shader-bottlenecks)。
-
-低 Occupancy 既可能来自工作量少，也可能与寄存器、线程组存储或调度约束有关；高 Occupancy 也不保证任务快。若 ALU 已成为主要限制，进一步提高并发未必有收益。它应与具体任务和其他 Counter 联合解释，见 [GPU occupancy](https://developer.apple.com/documentation/xcode/finding-your-metal-apps-gpu-occupancy) 和 [Metal Compute](https://developer.apple.com/videos/play/tech-talks/10580/)。
-
-### 2.3 单位与百分比的实际边界
-
-基线 A15 元数据中，27 项比例类指标的 `scale=100`、`maximum=100`；读写带宽和 `Partial Renders Count` 的 `scale=1`。比例类可按这份基线的 0–100 显示尺度理解，但这不构成跨设备单位保证。
-
-设备文字把读写带宽描述为 GB/s；`Partial Renders Count` 描述为 encoder 内部分渲染次数。正式 JSON 的 `counters[].unit` 目前仍为 `null`，`counters` 命令显示 unknown，CSV 也没有单位行。文档解释不会自动改变程序的单位识别能力。
-
-不要将 F16 与 F32 相加当成 100%，不要把三个 Occupancy 相加后命名为“总 GPU 使用率”，也不要将不同硬件路径的 Utilization 相加。它们可能重叠、分母不同，而且聚合丢失了样本间的时序关系。
-
-## 3. Windows 到 iPhone 的采集链路
-
-### 3.1 各层各做什么
+工具不直接访问 GPU 寄存器，也不向游戏插入采集代码。它通过 pymobiledevice3 调用设备 GPU 服务：先取得字段定义和 JS 公式，再接收采样字节，在电脑上执行公式并按秒输出。
 
 ```mermaid
-flowchart TD
-    A[Windows Python 主进程] --> B[pymobiledevice3 枚举与配对连接]
-    B --> C[lockdown 或 iOS 17+ RSD 隧道]
-    C --> D[DvtProvider / DTXConnection]
-    D --> E[设备 GPU Counter 服务]
-    E --> F[元数据与原始采样分批通知]
-    F --> G[主进程有界消息队列]
-    G --> H[独立工作进程]
-    H --> I[解码与 QuickJS 公式]
-    I --> J[一秒窗口]
-    J --> K[CSV 或 JSON]
-    J --> L[终端所选指标]
+flowchart LR
+    A[连接设备服务] --> B[元数据: 字段与 JS]
+    B --> C[设备推送采样字节]
+    C --> D[按字段顺序解包]
+    D --> E[差分与归一化]
+    E --> F[执行设备 JS]
+    F --> G[缩放并按秒取均值]
+    G --> H[终端与 CSV/JSON]
 ```
 
-这是本项目的数据流，不是 GPU 执行时序图。
+先记住三个对象：
 
-| 层次 | 实现责任 |
+| 对象 | 可以理解成 | 提供什么 |
+|---|---|---|
+| 元数据 metadata | 表格的字段说明与计算规则 | 指标名称、原始字段顺序、JS 函数和参数 |
+| 原始采样 raw samples | 尚未换算的仪表读数 | 时间戳及按固定顺序排列的整数 |
+| 解析结果 parsed results | 按规则算好的指标 | 每项 Counter 的数值、时间窗口与质量 |
+
+设备负责给出**数据与指标公式**；Python 负责**通信、解释字段、准备输入、执行公式和汇总**。这两部分不能混淆：不是所有计算都由 JS 完成，但 Python 也不会按机型重新编写指标公式。
+
+结果是全设备 GPU 数据，不能直接归因到某个游戏、Pass 或 Draw Call。工具只生成数据；本文的分析方法由使用者在其他工具中执行。
+
+## 2. Windows 如何连到设备
+
+### 2.1 每一层的作用
+
+| 层次 | 通俗解释 | 实现责任 |
+|---|---|---|
+| USB 与 Apple 通信组件 | 连接电脑和手机的道路 | Windows 驱动/系统组件 |
+| usbmux | 在多个设备及设备服务之间转接连接 | pymobiledevice3 |
+| lockdown | 确认信任、查询设备信息、建立服务连接 | pymobiledevice3 |
+| 隧道与 RSD | 为较新系统提供开发者服务通道，并查询服务端口 | pymobiledevice3 |
+| DVT / DTX | 用消息发送方法调用、接收回复和通知 | pymobiledevice3 |
+| GPU Counter 服务 | 提供 GPU 信息、元数据和采样 | 设备服务；本工具封装调用 |
+
+这些是协议职责，并不是每一层都启动一个独立进程。当前工具按 UDID 或唯一 USB 设备选择目标；再根据系统版本使用库的 lockdown 或 RSD 隧道路径。版本决定连接方式，不决定 Counter 公式。库支持某条路径也不等于本工具已经验证所有设备。
+
+`DvtProvider` 建立 DTX 连接后，通过 `open_channel(GpuService)` 打开 GPU 逻辑通道：
+
+```text
+com.apple.instruments.server.services.gpu
+```
+
+逻辑通道用于在同一 DTX 连接中区分服务，不应当成另一个 USB 设备或独立网络端口。
+
+### 2.2 Python 方法如何变成设备请求
+
+源码中的声明如下：
+
+```python
+@dtx_method("requestDeviceGPUInfo")
+async def device_info(self): ...
+```
+
+这里 `...` 不代表什么都没做。装饰器将调用映射为 DTX 请求，selector `requestDeviceGPUInfo` 是设备方法名：
+
+```text
+await service.device_info()
+  → 库编码方法名和参数
+  → 经 DTX 发送到 GPU 通道
+  → 设备返回回复
+  → 库解码并唤醒等待者
+  → Python 得到 list/dict 等对象
+```
+
+初始化依次执行：选设备 → 连接 DVT → 打开 GPU 通道 → `requestDeviceGPUInfo` → 查询 Mach 时间基准 → 配置 Counter。时间基准来自 DeviceInfo 初始化查询，不会同时启动 Graphics、Sysmontap 等性能采样器。
+
+### 2.3 请求回复与采样通知是两条逻辑路径
+
+| 方法 | 用途 |
 |---|---|
-| USB 设备选择、lockdown、信任状态 | 复用 pymobiledevice3；Windows 仍需可用的 Apple 通信组件 |
-| iOS 17+ 隧道与 RSD 服务发现 | 复用 `PreferredRsdTunnel` 等库接口，不自行实现传输协议 |
-| DVT / DTX 请求与通知分发 | 复用 `DvtProvider`、`DTXService`、装饰器及参数类型 |
-| GPU Counter 服务封装 | 本项目 `GpuService` 指定服务名、RPC selector 和通知队列 |
-| 二进制记录、指标公式、窗口和文件 | 本项目 `Decoder`、`FormulaEngine`、`WindowAggregator`、`ResultWriter` |
-
-`DTX` 可以理解为 Instruments 客户端与设备服务之间的 RPC/通知通道。本项目在库上声明 GPU 业务接口，由库处理底层传输和 DTX。库中 `DvtProvider` 使用的服务名包括旧路径 `com.apple.instruments.remoteserver.DVTSecureSocketProxy` 和 RSD 路径 `com.apple.instruments.dtservicehub`；实际连接由所选 provider 和库决定。
-
-### 3.2 初始化与开始采集
-
-源码入口为 [ios_gpu_counter.py](../ios_gpu_counter.py) 的 `connect_device`、`prepare_gpu` 和 `collect_parsed`：
-
-1. 按 UDID 或唯一 USB 设备选择目标；连接并查询系统版本。多设备不能唯一选择时直接说明原因。
-2. iOS 17+ 走库的 RSD 隧道路径；连接 DVT 服务。
-3. 打开 `com.apple.instruments.server.services.gpu` 通道。
-4. 调用 `requestDeviceGPUInfo`，选择唯一 GPU，并检查设备报告的 profile 支持情况。
-5. 用 `DeviceInfo.mach_time_info()` 获取设备时间换算比例。这是初始化查询，不启动其他性能采样器。
-6. 配置 Counter，随后调用 `startCollectingCounters`。
-7. 持续处理设备通知，直至 Ctrl+C 或明确错误。
-
-| RPC selector | 本项目用途 |
-|---|---|
-| `requestDeviceGPUInfo` | 获取 GPU 信息、accelerator-id 和支持的 profile |
-| `configureCounters:counterProfile:interval:windowLimit:tracingPID:` | 配置 GPU Counter 采集 |
-| `startCollectingCounters` | 开始设备采样 |
+| `requestDeviceGPUInfo` | 查询 GPU、accelerator-id 和支持的 profile |
+| `configureCounters:counterProfile:interval:windowLimit:tracingPID:` | 配置本次采集 |
+| `startCollectingCounters` | 开始采样 |
 | `stopCollectingCounters` | 停止采样 |
-| `flushRemainingData` | 仅停止后取回剩余数据 |
+| `flushRemainingData` | 停止后取回尾部 |
 
-当前固定配置为 `counterProfile=3`、`interval=0`、`windowLimit=-1`、`tracingPID=PInt32(-1)`。后三项中的 0/-1 是传给设备的协议值，**不能解释成 0 ms 采样、每秒一次或某个目标 App PID**。本项目的现场验证是全设备连续采样；配置没有暴露为用户调参项。
+当前固定参数为 profile=3、interval=0、windowLimit=-1、tracingPID=-1。它们是服务协议值，不代表“一秒采一次”，也没有选择目标游戏 PID。工具会检查设备报告的支持情况，不能自动确定唯一 GPU 或 profile 不支持时明确报错。
 
-### 3.3 设备返回哪些内容
+`await service.start()` 等待的是启动回复。元数据和采样通过通知回调独立到达：
 
-解析路径接受的通知主体形如 `[kind, ..., ..., count, body]`：
-
-| 类型 | 内容与处理 |
-|---|---|
-| `kind=0` | 指标元数据：显示定义、原始字段列表、JS 公式源码、GPU 参数 |
-| `kind=1` | `count` 条原始采样和二进制 `body` |
-| `[2, integer]` / `[3, integer]` | 已识别的控制通知，不能当成指标样本 |
-| NSError、未知布局或类型 | 显式错误，不能猜测后继续生成数据 |
-
-本基线元数据字典的 `"0"` 为显示 Counter，`"1"` 为原始字段定义，`"2"` 为 JavaScript，`"3"` 为 GPU 参数。一个显示定义目前读取为 `[name, maximum, description, function_name, scale, ...]`，末尾未使用字段不擅自解释。
-
-相同元数据重复通知不会重置跨包基线；元数据内容改变时停止本次会话，避免文件列定义和公式在录制中途变化。
-
-## 4. 从二进制记录到一个 Counter 数值
-
-### 4.1 原始记录布局与设备时间
-
-本基线每条记录是小端无符号 64 位整数序列：
-
-```text
-timestamp_ticks | raw_0 | raw_1 | ... | raw_N-1
+```python
+@dtx_on_notification
+async def notification(self, payload):
+    self.enqueue(payload)
 ```
 
-基线设备定义有 37 个原始字段，单条记录包含 38 个 uint64，即 304 字节。对一批 `count` 条记录，必须满足：
+通知放进主进程队列，随后交给解析工作进程。设备主动分批推送，工具没有每秒发一次“取样”请求。等待多久与设备批次有关，一秒输出窗口也不是网络发送频率。
+
+## 3. 一组元数据，怎样对应一条采样
+
+### 3.1 元数据的四部分
+
+当前解析器支持的 GPU 通知主体形如 `[kind, ..., ..., count, body]`。`kind=0` 是元数据，`kind=1` 是二进制采样；部分短控制通知只用于控制，不参与计算。这些已经是库解码后的服务对象，不是原始 USB/DTX 帧。
+
+元数据主体的字典键含义如下：
+
+| 键 | 内容 | 代码中的去向 |
+|---|---|---|
+| `0` | 最终指标定义 | `Decoder.counters` |
+| `1` | 原始字段名称、顺序与处理标记 | `Decoder.raw_fields` |
+| `2` | JS 源码字符串 | `FormulaEngine` |
+| `3` | GPU 参数 | JS 全局变量 |
+
+设备的字段名可能是难以阅读的长标识。它来自元数据，不由工具计算或反推；同一个标识连接了“元数据里的字段”“采样数组中的位置”和“JS 使用的变量”。
+
+### 3.2 通用合成例子
+
+假设某个**虚拟设备**提供这三个原始字段：
 
 ```text
-expected_bytes = count × (raw_field_count + 1) × 8
-elapsed_s = (timestamp_ticks - first_timestamp_ticks) × numer / denom / 1e9
-interval_ns = (timestamp_ticks - previous_timestamp_ticks) × numer / denom
+raw_fields[0] = ["GRC_GPU_CYCLES", false]
+raw_fields[1] = ["work", false]
+raw_fields[2] = ["active", true]
 ```
 
-长度不匹配即报错，不截断后继续读取。这里的 `numer/denom` 来自设备 Mach timebase；时间原点是首条设备样本，不是 Windows 启动时间或数据包抵达时间。
+`true` 表示主机直接使用当前读数，不做普通累计差分；`false` 的普通字段需要前后相减。`GRC_GPU_CYCLES` 等协议上下文字段另有直接取值规则，不能因为标记为 false 就相减。
 
-首条累计型样本只建立基线。完全重复记录不再次计入；非递增时间戳标记异常。`Decoder.previous` 跨消息保留，因此下一批的第一条样本可以使用上一批的最后一条作差。
-
-### 4.2 累计值、瞬时值与归一化
-
-原始字段中的布尔标记控制是否按累计量处理：普通累计字段取当前值减前值，瞬时字段保留当前值；`GRC_TIMESTAMP`、`GRC_GPU_CYCLES`、`GRC_ENCODER_ID`、`GRC_KICK_TRACE_ID`、`GRC_SAMPLE_TYPE` 走专门规则，不进行普通累计差分。
-
-随后生成公式变量，字段名中的空格和冒号替换为下划线；发现重名立即报错。存在有效正数 `GRC_GPU_CYCLES` 时，另为每个变量生成：
+一条二进制记录为：
 
 ```text
-field_norm = field_value / GRC_GPU_CYCLES
+timestamp | GRC_GPU_CYCLES | work | active
 ```
 
-这不是对所有 Counter 套同一个“除以秒数”的公式。某些设备函数使用归一化值，某些使用时间、原始差分或其他函数，必须以当前设备下发的 JS 为准。
+每个数占 8 字节，是小端 uint64，因此这个例子每条为 32 字节。真实记录长度始终按元数据计算：
 
-Python 先处理 uint64 和差分，再检查传入 JavaScript 的整数安全范围 `2^53−1`，避免 JS 双精度数将大整数静默舍入。无效周期、计数器下降或时间问题会产生质量状态，不能用零掩盖。
+```text
+每条字节数 = (原始字段数 + 1) × 8
+整包字节数 = count × 每条字节数
+```
 
-### 4.3 执行设备公式并缩放
+Python 解包后执行 `timestamp, *raw = row`。于是 `raw_fields[i]` 对应 `raw[i]`；保留的 `previous` 是包含时间戳的完整上一条记录，对应值在 `previous[i+1]`。这就是差分时下标加一的原因。
 
-`FormulaEngine` 在 QuickJS 中加载设备源码和 GPU 参数，按每个 Counter 的 `function_name` 调用函数。每个样本还传入 `MTLStat_nSec`、`SAMPLE_INTERVAL_USEC`、`_LastTimestamp` 等上下文。源码可以定义多于 30 个函数，只有元数据选择的显示函数形成本次输出列。
+### 3.3 原始读数先变成公式输入
 
-以基线设备定义的 `ALU Utilization` 为例，设备函数如下；哈希形式的变量名保留原样，没有按名字猜测其硬件事件含义：
+假设前后两条记录如下，时间戳暂用 T0/T1 表示：
+
+| 记录 | 时间戳 | cycles | work | active |
+|---|---|---:|---:|---:|
+| 上一条 | T0 | 100 | 1000 | 12 |
+| 当前条 | T1 | 100 | 1040 | 20 |
+
+`Decoder._prepare_formula_inputs()` 得到：
+
+```text
+GRC_GPU_CYCLES = 100          协议字段，直接取当前值
+work = 1040 - 1000 = 40      普通累计字段，求增量
+active = 20                 true 标记，直接取当前值
+```
+
+同一解析器保留跨包前值，第二包首条可以用第一包末条做差分。首条公式采样只能建立基线，完全重复记录不重复计算。
+
+### 3.4 `_norm` 是 Python 生成的变量
+
+主机同时保留上述值，并生成：
+
+```text
+work_norm = work / GRC_GPU_CYCLES = 40 / 100 = 0.4
+active_norm = active / GRC_GPU_CYCLES = 20 / 100 = 0.2
+```
+
+`_norm` 不是设备又发了一组字段，也不是 JS 自动给变量加后缀。它是 Python 新增的“按当前周期字段归一化”的输入。它不一定在 0～1 之间，不直接等于百分比；JS 可以选择原值、差分值、`_norm` 或时间上下文，并非每个指标都使用 `_norm`。
+
+`GRC_GPU_CYCLES` 随当前样本传入，不是 GPU 主频或主机接包间隔。当前解析器要求它为正数；设备元数据不足以证明该字段覆盖所有经过周期还是仅活跃周期，不能进一步推断。
+
+## 4. 从 JS 返回值到一秒结果
+
+### 4.1 JS 执行与显示缩放
+
+继续使用合成例子，虚拟设备的显示定义为：
+
+```text
+["Demo Utilization", 100, "合成示例 / Synthetic example", "demo", 100, 0]
+```
+
+依次对应名称、上限、说明、函数名、缩放倍数；末尾未使用字段不猜测含义。其 JS 为：
 
 ```javascript
-function ALUUtilization()
-{
-    return _c4c7e4c8f7b6488a9a980bba9f849c9e5d8e4bbb1e2c134cef7620b6faf7d6a2_norm * 2 / num_cores;
+function demo() {
+    return work_norm;
 }
 ```
 
-主机再统一执行：
+QuickJS 执行后返回 0.4；Python 根据设备定义执行：
 
 ```text
-displayed = min(max(formula_result × scale, 0), maximum)
+显示值 = min(max(JS 返回值 × scale, 0), maximum)
+       = min(max(0.4 × 100, 0), 100)
+       = 40
 ```
 
-该设备元数据的 `num_cores=5`、`scale=100`。**纯算术示例**：若该 `_norm` 输入为 0.75，则公式返回 0.3，显示值为 30；它不表示实测了 30% 的帧时间。限幅是当前实现的一部分，不能拿已限幅的结果反推原始事件量。
+这个 40 是**一条样本**的指标值。字段名字、函数、缩放和上限都来自元数据；不会因看到 Utilization 就自行乘 100，也不会使用某个机型的核心数或时钟常量。
 
-某个函数抛异常或返回非有限值时，该项为 `null`，其他成功计算的 Counter 仍可保留。QuickJS 设置了 64 MiB 内存、1 秒执行时间和 1 MiB 栈限制；这些是资源保护，不等同于对任意不可信 JS 的完整安全隔离承诺。
+### 4.2 时间与带宽没有统一的机型常量
 
-### 4.4 读写带宽为什么不能直接写成“差分字节除以 1 秒”
-
-当前 A15 公式中，`GPUReadBandwidth()` 调用 `BytesReadFromMainMemory()`；后者对两个原始字段的处理结果求和再乘 64。写带宽的字节函数对另一个字段乘 64。分母使用设备公式的时钟字段及 `1000/24` 系数：
+设备时间戳通过查询得到的 Mach 比例换算：
 
 ```text
-read_bytes = 64 × (read_event_a + read_event_b)
-write_bytes = 64 × write_event
-sample_bandwidth = bytes / max(1, clock_delta × (1000 / 24))
+相对秒数 = (当前 timestamp - 首条 timestamp) × numer / denom / 1e9
+采样间隔纳秒 = (当前 timestamp - 上一条 timestamp) × numer / denom
 ```
 
-以上变量是便于阅读的代称：三个事件分别对应基线设备定义中的 `_e798…`、`_aac2…`、`_1901…` 字段，时钟对应 `_792173…`。具体标识和函数由每次连接的设备提供，不能据此给其他设备硬编码同一组原始字段。公式与该基线的纳秒换算、设备 GB/s 描述相符：bytes/ns 在十进制单位下数值等于 GB/s；不能据此推断所有设备同样使用 64 字节事件或 24 MHz 时钟。
+主机将这些时间上下文与变量传给 JS。带宽的含义是数据量除以时间，但具体字节换算系数、时间分母及所用原始字段由设备 JS 决定，不在 Python 中硬编码。也不把设备攒包的等待时间作为带宽分母。
 
-工具先逐样本算带宽，再对这些值求均值，不先累计整秒字节再除以整秒时间。设备带宽分母也不是 Windows 的回包间隔，不能用“等了 30 秒才收到包”去重新除一次。
+### 4.3 一秒一行：有效样本算术平均
 
-### 4.5 异常数据统一提示并跳过
+样本按设备相对结束时间进入 `[k, k+1)`；边界样本归下一窗口。若某项指标在同一窗口的有效值为 20、40、60，输出均值为 40。每项指标有独立有效分母，正常零值计入，缺失不补零。
 
-虽然记录容器是 uint64，底层累计计数器仍可能回绕、重置或返回异常值。工具不根据设备型号、JS 指纹、特定字段名或假定的计数位宽修正负差分，对所有设备采用相同规则：
+这是**样本等权平均**，不是时间加权平均。即使某项叫 Count，导出值也不是该秒事件总次数。最后不足一秒的尾窗只到最后观测时间，不虚构完整覆盖。
 
-- 累计字段下降：标记 counter_reset_or_wrap，在 stderr 输出 [ERROR]，跳过该样本的所有指标；不加 2^32 或猜测正确值。
-- 随后时间递增的样本继续以最新原始读数为差分基线计算，避免一次重置导致后续一直无法恢复。
-- 时间倒序或同时间戳异常：跳过，且不让这条异常记录替换前值基线。
-- 单个指标公式失败：该指标缺失，其余有效指标保留。基线及完全重复记录按既有规则不参与均值，不属于需报错的异常。
+| 输出 | 时间与数值 |
+|---|---|
+| CSV | time_ms 为窗口起点毫秒；随后为 Counter 原名列；缺失空单元格 |
+| JSON | 秒单位窗口及 values，附带质量/分母/结束状态；缺失 null |
+| 终端 | 每窗口一个 key: value 的 JSON 行，指标在 values 中；来自同一 WindowRecord |
 
-首次及每累计 1000 条同类异常输出原因、样本序号、设备相对时间，结束时给出总计。错误不写进 CSV 数据行；JSON 仍保留质量计数，并在现场 capture 摘要中提供 sample_errors。存在可用数据但发生异常时为 partial；这不等于整场采集立即停止，也不意味着缺失被修复。仅验证范围的设备型号标签不参与以上数值处理。使用时结合 [已知限制](USAGE.md#兼容性与已知限制) 判断结果完整性。
+### 4.4 异常时怎么处理
 
-## 5. 一秒一行是如何形成的
+| 情况 | 行为 |
+|---|---|
+| 累计字段出现负差分 | ERROR 提示并跳过整条，不猜位宽、不自动修正回绕；后续递增数据继续 |
+| 时间倒序或同时间戳异常 | 跳过且不替换差分基线 |
+| 无效周期或不安全整数 | 跳过，不把错误替换成零 |
+| 单个 JS 函数失败/非有限值 | 该项缺失，其他有效指标仍可保留 |
+| 元数据改变、布局无法解释、断连、写盘失败 | 按停止保护完成已有结果，不冒险继续解释 |
 
-样本以设备相对结束时间进入 `[k, k+1)` 窗口，恰好落在右边界的样本进入下一窗口。对 Counter `c`：
+`partial` 表示有可用数据但不完整；`failed` 表示没有有效结果；正常不足一秒尾窗本身不导致 partial。错误计数会保留，重复提示按类型限频。完整规则见 [输出契约](OUTPUT_FORMAT.md)。
 
-```text
-window_value[c] = sum(valid_sample_values[c]) / valid_count[c]
-CSV time_ms = window_start_s × 1000
+## 5. 为什么使用异步和独立进程
+
+### 5.1 `await` 不等于乱序执行
+
+连接、配置、启动仍按代码顺序执行。`await service.stop()` 只是让当前流程等待回复，此时事件循环还能接收设备通知、检查超时或响应停止事件。当前库的通信接口本身也是异步的。
+
+计算和写盘并不是“异步就会更快”。工具把它们隔离到进程中：
+
+| 执行位置 | 负责什么 | 为什么这样分 |
+|---|---|---|
+| 主进程事件循环 | 设备连接、DTX 接收、停止与超时 | 等回复时仍能接收通知 |
+| 解析子进程单线程 | Decoder、QuickJS、窗口、结果文件及终端数据 | 保证 JS 线程约束，阻塞时可终止进程 |
+| 可选 Debug 子进程 | 元数据、JS、二进制与消息索引 | 原始文件写入不阻塞接收回调 |
+
+接收队列有消息数/字节预算；解析批次最多按 512 条拆成主机任务，每次只等一个请求完成。这是主机工作划分，不改变设备采样频率。原始 Debug 记录发生在拆分/解析之前。
+
+### 5.2 停止后为什么要取尾
+
+```mermaid
+sequenceDiagram
+    participant U as 操作者
+    participant P as 主进程
+    participant D as GPU 服务
+    participant W as 解析进程
+    U->>P: Ctrl+C
+    P->>W: 等当前子批结束
+    P->>D: stopCollectingCounters
+    P->>W: 排空早期子批与已收通知
+    P->>D: flushRemainingData
+    D-->>P: 尾包
+    P->>W: 处理尾包
+    P->>D: 关闭连接
+    P->>W: 完成尾窗与文件
 ```
 
-每个 Counter 的分母独立。基线、重复或该项无效的值不计入，正常 0 计入。不存在有效值时输出 CSV 空单元格或 JSON `null`。
+不能直接杀进程：手机端可能还有未推送数据。也不能正常录制期间周期 flush 来假装每秒实时刷新。拔线后无法取回设备未发出的内容，因此只保留主机已有结果并标明 partial。底层同步 OS 调用完全卡死不属于 asyncio 超时可强制打断的保证范围。
 
-这个均值不是时间加权平均。例如同一统计集合内，持续 9 ms 的样本值为 10、持续 1 ms 的样本值为 90，算术均值为 50，而时间加权值为 18。本工具采用前者。跨秒间隔也不拆分权重，因此不能宣称导出值是严格的“整秒硬件忙碌时间占比”。
+### 5.3 Debug 保存的“原始”到哪一层
 
-三条实践规则：
+开启 `capture --debug` 后，`captures/<本次时间戳>/debug/` 保存服务载荷：元数据、原文 JS、原始采样字节、控制通知和 RPC 回复。它们已经过库的 DTX 解码，**不是 USB/DTX 帧抓包**。被过滤的采样仍能在原始字节中找到。
 
-- **Count 仍取均值**：`Partial Renders Count=0.5` 并不矛盾，它是样本均值；不能读作该秒发生 0.5 次，也不能直接乘 FPS。
-- **带宽均值不宜直接积分为精确流量**：样本权重、空缺、尾窗都会影响积分；要精确字节量需要额外的原始计量依据。
-- **空缺不是空闲**：缺失数据不补零；数据断开后的窗口不持续虚构。结束时尾窗可以不足一秒，不因此自动判定整场失败。
+JSON 类型标记与 bin 引用用于避免整数键、大整数和二进制失真。closed 只表示已接受记录写入结束，不表示设备采集完整。Debug 增加磁盘及计算开销，正常使用默认关闭。路径与阅读方式见 [Debug 使用说明](USAGE.md#debug-原始数据保存)。
 
-`WindowRecord` 同时驱动文件与终端，文件先写后显示，不进行第二套聚合。CSV 仅有 `time_ms` 和全部 Counter 原名；终端使用 `start_s/end_s/status` 和所选指标；JSON 附带分母、质量与结束状态。`partial_window` 表示尾窗长度，窗口 `partial` 表示质量不完整，整场 `partial` 表示会话不完整，三者不能混用。详细字段仍以 [输出契约](OUTPUT_FORMAT.md) 为唯一标准。
+## 6. 指标字典：这些数据能帮助判断什么
 
-## 6. 当前 30 项 Counter 的用途
+先分清五类量：Limiter 是某条路径工作/停顿的限制线索，Utilization 是对应路径实际利用程度，Occupancy 是并发 SIMD 组相对容量，Bandwidth 是单位时间的数据量，Count 是事件量。它们不是同一种“GPU 使用率”，不能相加成一个总值。
 
-以下名称及定义来自 iPhone 13 Pro / A15 / iOS 18.5 返回的元数据，可通过 counters 命令查看所连设备的定义。表中的“候选问题/核实方法”是结合游戏工作负载提出的调查假设，不是设备元数据保证的根因，也不是本工具生成的诊断结论。没有跨游戏通用的“超过 80 就异常”阈值。
+Occupancy 不是显存占用；带宽也不是内存容量。高值可以说明工作很多，也可能反映低效；低值可能是工作不足或在等待。要与具体工作负载及外部 GPU 耗时共同判断。没有按字段数值直接认定瓶颈的通用阈值。
+
+以下列举已遇到的指标名称及其设备说明，不是每台设备都必须支持的固定清单。请通过 counters 命令查看当前设备的实际定义。表中的“候选问题/核实方法”是结合游戏工作负载提出的调查假设，不是设备元数据保证的根因，也不是本工具生成的诊断结论。没有跨游戏通用的“超过 80 就异常”阈值。
 
 ### 6.1 算术与精度：4 项
 
@@ -266,8 +308,8 @@ CSV time_ms = window_start_s × 1000
 | `Texture Sample Limiter` | 纹理采样路径的限制相关程度 | 多层材质、阴影采样、后处理反复取样；逐项减少采样或关闭对应效果，检查时间变化 |
 | `Texture Sample Utilization` | 纹理采样的实际利用程度 | 与采样 Limiter 联看，确认取样工作特征；它不是每帧采样次数 |
 | `Texture Filtering Limiter` | 纹理过滤路径的限制相关程度 | 过滤设置或输入纹理格式可能影响开销；固定其他条件改变过滤方式并复测 |
-| `Texture Cache Limiter` | 纹理缓存路径相关指标；本设备文字只给出简短名称 | 可调查纹理访问局部性、工作集变化；不能直接读作 cache miss rate，需要更细粒度计数器确认 |
-| `Texture Write Limiter` | 纹理写入路径的限制相关程度；本设备描述较简略 | Render Target、后处理输出或显式纹理写入；改变输出分辨率、格式或 Pass 组织作对照 |
+| `Texture Cache Limiter` | 纹理缓存路径相关指标；已有设备定义文字只给出简短名称 | 可调查纹理访问局部性、工作集变化；不能直接读作 cache miss rate，需要更细粒度计数器确认 |
+| `Texture Write Limiter` | 纹理写入路径的限制相关程度；已有设备定义描述较简略 | Render Target、后处理输出或显式纹理写入；改变输出分辨率、格式或 Pass 组织作对照 |
 | `Texture Write Utilization` | 纹理写入实际利用程度 | 辅助确认写路径活动，不代表所有读写都已到 DRAM；与写带宽及对应 Pass 同看 |
 
 这里的调整是实验变量，不是应一律降低的画质选项。Apple 对纹理读写路径、过滤和像素格式的关系有专门说明，可参考 [GPU Counter 介绍](https://developer.apple.com/videos/play/wwdc2020/10603/)；本工具未提供纹理资源或 Pass 的直接归因。
@@ -323,7 +365,7 @@ LLC 活动高并不要求外部带宽也高，缓存可以吸收访问；反之�
 | `Vertex Occupancy` | 顶点 Shader 并发 SIMD 组相对 GPU 最大并发容量 | 人物、网格、实例或顶点处理变化的线索；用引擎顶点统计和具体 Pass 时间确认，不直接推算面数 |
 | `Fragment Occupancy` | 片元 Shader 并发 SIMD 组相对最大容量 | 分辨率、材质、透明效果变化的线索；不等于填充率或 overdraw，也不代表片元阶段占帧时间比例 |
 | `Compute Occupancy` | 计算 Shader 并发 SIMD 组相对最大容量 | 粒子、剔除、图像计算等并发活动；需要具体 dispatch 才能确认低并发原因 |
-| `Partial Renders Count` | 设备定义的 encoder 内部分渲染次数，导出为有效样本均值 | 持续非零或随功能变化时，进一步查看对应渲染 Pass；仅凭本设备短描述不能确定触发原因，更不能等同于掉帧、Pass 数或内存溢出次数 |
+| `Partial Renders Count` | 设备定义的 encoder 内部分渲染次数，导出为有效样本均值 | 持续非零或随功能变化时，进一步查看对应渲染 Pass；仅凭已有设备定义短描述不能确定触发原因，更不能等同于掉帧、Pass 数或内存溢出次数 |
 
 本工具没有 `TotalOccupancy` 列，也不会从这三个值构造 GPU Usage。关于并发量、寄存器及线程组资源的进一步定位，参见 [GPU occupancy](https://developer.apple.com/documentation/xcode/finding-your-metal-apps-gpu-occupancy)。
 
@@ -363,77 +405,33 @@ LLC 活动高并不要求外部带宽也高，缓存可以吸收访问；反之�
 
 如果目的是解释某一帧 100 ms 卡顿，本工具的一秒均值可能看不到短尖峰，优先补足逐帧时间线。当前 Counter 列也不包含温度、频率、功率或显存分配量，不从它们单独推断热降频、功耗或资源泄漏。
 
-## 9. 为什么实现里有队列、工作进程和分阶段收尾
+## 9. 如何阅读源码
 
-### 9.1 连续性与主机开销
+主文件 [ios_gpu_counter.py](../ios_gpu_counter.py) 按职责分区，入口在末尾。第一次阅读不必从 import 开始逐行读，建议沿以下路线：
 
-当前现场观察到设备常以约 20,000 条样本一批推送，这只是基线经验，不是协议固定批量。主进程接收 DTX，`GpuEventQueue` 有 2,048 条消息及估算 64 MiB 负载双上限；溢出明确失败，不静默丢样。
+| 顺序 | 符号 | 先回答这个问题 |
+|---|---|---|
+| 1 | `main` / `build_parser` | 用户选了哪个命令，输出到哪里？ |
+| 2 | `live` | 什么时候创建连接/进程，失败后谁负责清理？ |
+| 3 | `connect_device` / `prepare_gpu` | 如何使用库找到并配置 GPU 服务？ |
+| 4 | `GpuService` / `collect_parsed` | 回复与通知如何进来，如何开始和结束？ |
+| 5 | `ParsedPipeline` | 哪条消息是元数据，哪条是样本？ |
+| 6 | `Decoder.metadata` / `Decoder.samples` | 字段如何绑定，二进制如何解包？ |
+| 7 | `_prepare_formula_inputs` / `_evaluate_counters` | 哪些值差分、如何生成 _norm、如何调用 JS？ |
+| 8 | `WindowAggregator` / `ResultWriter` / `WindowOutput` | 怎样按秒平均，怎样保证文件和终端一致？ |
+| 按需 | `CaptureWorker` / `stage_wait` / `run_capture` | 进程通信、超时与退出如何保证有界？ |
+| 按需 | `DebugRecorder` / `DebugArchive` | 原始数据在哪里被记录和写盘？ |
 
-QuickJS 和文件由一个独立工作进程的单线程持有。这样可以维持解释器线程约束，也能在解码或写入长期不返回时终止工作进程，避免普通写盘线程拖住 Python 退出。主机再将大批次按最多 512 条记录切成处理任务，每次只有一个在途请求；记录顺序和字节不变，不改变设备采样频率。
+源码中标注的“已验证设备”只是既有验证范围，不选择数值公式，也不拦截其他设备。理解通用算法时不需要依赖该标签；真实适用范围见 [使用说明](USAGE.md#兼容性与已知限制)。
 
-### 9.2 Ctrl+C 与拔线不是同一种收尾
+## 10. 继续阅读
 
-```mermaid
-sequenceDiagram
-    participant U as 操作者
-    participant P as 主进程
-    participant D as 设备 GPU 服务
-    participant W as 工作进程
-    U->>P: Ctrl+C
-    P->>W: 完成当前处理子批
-    P->>D: stopCollectingCounters
-    P->>W: 排空早期子批与已收通知
-    P->>D: flushRemainingData
-    D-->>P: 剩余数据
-    P->>W: 解码尾部
-    P->>D: 关闭连接
-    P->>W: 完成尾窗并关闭结果文件
-```
+- [输出格式](OUTPUT_FORMAT.md)：对接 CSV/JSON/Debug 文件时查字段，避免重复猜测。
+- [pymobiledevice3](https://github.com/doronz88/pymobiledevice3)：通信库；本工具固定版本，在线主分支可能不同。
+- [Apple GPU Counter 介绍](https://developer.apple.com/videos/play/wwdc2020/10603/)：理解 GPU 架构与计数器类别。
+- [Reducing shader bottlenecks](https://developer.apple.com/documentation/xcode/reducing-shader-bottlenecks)：理解各执行路径的 Limiter/Utilization。
+- [GPU occupancy](https://developer.apple.com/documentation/xcode/finding-your-metal-apps-gpu-occupancy)：理解并发量及资源约束。
+- [GPU memory bandwidth](https://developer.apple.com/documentation/xcode/measuring-the-gpus-use-of-memory-bandwidth)：区分带宽与内存容量。
+- [Metal 性能分析流程](https://developer.apple.com/documentation/xcode/analyzing-the-performance-of-your-metal-app)：用更细的时间线继续定位，界面随工具版本变化。
 
-工作进程忽略控制台 SIGINT，由主进程协调结束。正常录制没有定时停止参数；内部超时属于失败保护。`flushRemainingData` 只在停止后使用，不周期调用来假装“实时一秒一刷”。
-
-拔线后 stop/flush 可能失败，仍应保存主机已经收到并处理的数据，返回 `partial` 与非零退出码。设备尚未发出的内容无法取回。因此，实际录制时长可能超过结果覆盖时长；这个缺口必须报告，不能补零或自动重连拼接。
-
-另外，初始化完成后释放不再使用的远程 lockdown；DVT 最终关闭前暂停读取再由库关闭，以避免已验证的 Windows Proactor 退出回调竞争。这类处理依赖当前固定库版本，升级通信库后应重新确认连接与退出行为。
-
-### 9.3 文件完整性的边界
-
-文件逐窗口写入并 flush，不在内存中累计整场数据；JSON 以 `.part` 形式逐行追加，收尾后形成完整文件。flush 不是断电持久化保证。完整解析行可由恢复工具读出，但恢复不代表一次完整现场成功。
-
-默认产物仅保留解析结果，不能事后从 CSV/JSON 重放原始硬件公式。恢复只保留已有完整行，不代表原本缺少的采样已经补齐。
-
-需要观察设备实际返回内容时，使用 `capture --debug`。`DebugRecorder` 在 GPU 通知进入解析队列前记录载荷，初始化及启停/flush 的返回值也单独记录；`DebugArchive` 在额外的独立进程中保存元数据 JSON、原文 JS 和二进制采样。它直接保存原始字节，不用解析值重建二进制，也不采集其他性能通道。被跳过的异常样本仍保留在原始归档中。文件格式与类型标记见 [Debug 附加文件](OUTPUT_FORMAT.md#debug-附加文件)。
-
-本工具与 Xcode 使用同类设备服务，并不证明 Counter Set、采样窗口和显示数值完全一致；尚未完成同条件绝对数值对标。适用范围与数据质量限制见 [使用说明](USAGE.md#兼容性与已知限制)。
-
-## 10. 源码与资料导航
-
-### 10.1 从功能定位实现
-
-本工具保持 [ios_gpu_counter.py](../ios_gpu_counter.py) 单脚本交付。阅读时可按下面的符号查找。
-
-| 符号 | 重点阅读的问题 |
-|---|---|
-| `build_parser` / `main` | 四个用户命令、固定策略、文件格式与退出码 |
-| `connect_device` / `prepare_gpu` | USB 选择、RSD 路由、GPU/profile 探测、timebase 与初始化连接释放 |
-| `GpuService` / `GpuEventQueue` | RPC selector、异步消息和队列上限 |
-| `Decoder.metadata` / `Decoder.samples` | 元数据校验、二进制布局、差分与通用异常过滤 |
-| `FormulaEngine` | JS 上下文、公式函数调用、数值错误和资源限制 |
-| `ParsedPipeline` | 消息类型识别、元数据不变性、解码到窗口衔接 |
-| `WindowAggregator` / `WindowRecord` | 时间归属、独立分母、尾窗和质量状态 |
-| `ResultWriter` / `WindowOutput` | CSV/JSON 写入、终端数值一致性和缺失值表达 |
-| `CaptureWorker` / `processing_chunks` | 独立进程、单请求往返、512 记录子批和超时 |
-| `collect_parsed` / `close_gpu_connection` / `run_capture` | 启停、取尾、资源释放与事件循环退出 |
-
-设备通信由 [pymobiledevice3](https://github.com/doronz88/pymobiledevice3) 提供。本工具固定使用 11.39.0 版，相关库模块包括 `dtx/service.py`、`services/dvt/instruments/dvt_provider.py`、`device_info.py` 和 `remote/rsd_tunnel.py`，在线主分支可能变化。
-
-### 10.2 用户文档与官方说明
-
-- [输出格式](OUTPUT_FORMAT.md)：消费者应遵循的字段、聚合、异常与恢复契约。
-- [Apple GPU Counter 介绍](https://developer.apple.com/videos/play/wwdc2020/10603/)：架构背景、Counter 类别和工具定位。
-- [Reducing shader bottlenecks](https://developer.apple.com/documentation/xcode/reducing-shader-bottlenecks)：Limiter/Utilization 和不同执行路径。
-- [GPU occupancy](https://developer.apple.com/documentation/xcode/finding-your-metal-apps-gpu-occupancy)：并发量及其限制因素。
-- [GPU memory bandwidth](https://developer.apple.com/documentation/xcode/measuring-the-gpus-use-of-memory-bandwidth)：带宽解释与分析上下文。
-- [Analyzing the performance of your Metal app](https://developer.apple.com/documentation/xcode/analyzing-the-performance-of-your-metal-app)：结合 CPU/GPU 时间线继续定位；具体界面随 Xcode 版本变化。
-
-解读新设备指标时，先核对设备定义；没有说明的单位、事件含义与性能结论保持未确认，不把分析假设写成设备事实。
+服务连通、离线公式计算成功、真机采集和 Xcode 数值对标是不同层次的证据。本工具未完成跨机型全面验证或同条件 Xcode 绝对数值对标，不能因拿到了数据就宣称所有设备都准确可用。

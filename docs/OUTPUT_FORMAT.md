@@ -2,11 +2,21 @@
 
 CSV 输出 time_ms 与 Counter 原名列；JSON 使用 ios_gpu_counter.rows.v2，保留质量统计与结束状态。
 
+本文是数据对接参考。先了解“数据怎么来、怎么计算”，请读 [从零技术说明](TECHNICAL_GUIDE.md)；直接使用工具请读 [README](../README.md)。
+
+| 你要做什么 | 查哪里 |
+|---|---|
+| 用表格软件或脚本读取 CSV | 第 4 节：列名、毫秒时间与空值 |
+| 读取 JSON 并判断质量 | 第 2、5 节：窗口字段与整场结束状态 |
+| 明白每秒均值的分母与尾窗 | 第 1 节：时间与聚合 |
+| 查字段单位 | 第 3 节及“字段与单位” |
+| 看 --debug 原始记录 | “Debug 附加文件” |
+
 可直接读取的合成样例：[精简 CSV](examples/sample.csv)、[详细 JSON](examples/sample.json)。CSV 展示时间和指标值；JSON 另外展示质量计数和尾窗信息。样例只用于说明格式，不代表设备测量。
 
 ## 1. 时间与聚合
 
-- 时间单位是秒，原点沿用 Decoder 的首条设备时间戳；采用 Mach timebase 换算后的设备相对时间，与主机回包时间无关。
+- 内部窗口、JSON 与终端使用秒；CSV 的 time_ms 使用毫秒。原点为首条设备时间戳，经设备 Mach timebase 换算，与主机回包时间无关。
 - 默认窗口宽度为 1 秒，按样本结束时间归属 `[k, k+1)`。恰好在边界的样本进入下一窗口；跨边界采样间隔不拆分权重。
 - 每项 Counter 单独对有限数值求算术平均，分母为自己的 `valid_counts`。正常的数值 0 必须计入；基线、重复样本不计入分母。局部公式异常不影响其他有效 Counter。
 - 计数型指标也是样本均值，不代表秒内事件总数；不额外转换为速率或时间加权利用率。
@@ -65,7 +75,7 @@ CSV 输出 time_ms 与 Counter 原名列；JSON 使用 ios_gpu_counter.rows.v2�
 - 会话整体结束状态仍由 stderr/退出码报告；精简 CSV 的指标值不能单独证明整场数据完整。进程被强杀时可能留下不完整的最后一行，尚无 CSV 自动修复。
 - time_ms 是唯一保留列名。如设备恰好提供同名 Counter，CSV 在创建文件前拒绝并提示使用 JSON，防止重名或静默丢列。
 
-示例列头：`time_ms,ALU Utilization,Fragment Occupancy,GPU Read Bandwidth,...`。当前 30 项 Counter 的 CSV 从 41 列减少到 31 列。已有采集文件不自动改写；消费旧 CSV 的脚本需将 start_s/time_s 换算为毫秒并改名为 time_ms，并移除自行添加的 counter: 前缀。JSON schema 不变。
+示例列头：`time_ms,ALU Utilization,Fragment Occupancy,GPU Read Bandwidth,...`。列数为 1 加当前设备提供的 Counter 数量，不固定。已有采集文件不自动改写。
 
 ## 5. JSON
 
@@ -112,11 +122,11 @@ result.capture 包含 collection_elapsed_s、sample_count、sample_span_s、row_
 
 ## 字段与单位
 
-README 的 30 项字段来自 iPhone 13 Pro / A15 / iOS 18.5 profile 3；逐项用途见 [技术说明](TECHNICAL_GUIDE.md)。其他设备可能返回不同字段，以 counters 命令为准。
+字段名称、描述、缩放和上限来自设备元数据；逐项用途见 [技术说明](TECHNICAL_GUIDE.md)。不同设备可能返回不同字段，以 counters 命令为准。
 
 - time_ms 是工具加入的毫秒时间列，不是硬件 Counter。
 - 当前 CounterDefinition.unit 为 null；counters 显示 unknown。本项目不根据字段名自动推断单位。
-- 除读/写带宽和 Partial Renders Count 外，基线其余 27 项的定义为 scale=100、maximum=100；显示范围不能替代跨设备单位验收。
+- 指标按设备给出的 scale 与 maximum 缩放及限幅，不由名称决定。即使显示范围是 0～100，也不能据此认定已完成跨设备单位验收。
 - 带宽的设备说明使用 GB/s，指 GPU 外部内存；未与 Xcode 做绝对对账，也不自动换算 GiB/s 或 MB/s。
 - Limiter 是设备定义的限制相关指标，不能仅凭名称判定瓶颈；短描述字段不补出未经证实的硬件含义。Utilization 是对应路径利用程度，不将不同项相加成总利用率。
 - Occupancy 是并发 SIMD 组相对最大容量的占比，不是显存占用；MMU 字段描述末级缓存未命中后的请求，不是页故障计数。
