@@ -152,10 +152,20 @@ def error_guidance(exc):
     return "保留错误阶段和已有结果；先运行 doctor，再按失败项处理 / Run doctor and inspect the failed stage."
 
 
+def print_status(message, stream=None):
+    """状态输出不可写时继续收尾；数据输出由 WindowOutput 单独处理。
+    Keep cleanup running if status output is unavailable; WindowOutput handles data output separately.
+    """
+    try:
+        print(message, file=stream if stream is not None else sys.stderr, flush=True)
+    except (OSError, UnicodeError, ValueError):
+        pass
+
+
 def print_error(exc):
     phase = getattr(exc, "gpu_stage", "")
-    print(f"错误 / Error [{phase or type(exc).__name__}]: {type(exc).__name__}: {exc}", file=sys.stderr)
-    print("下一步 / Next: " + error_guidance(exc), file=sys.stderr)
+    print_status(f"错误 / Error [{phase or type(exc).__name__}]: {type(exc).__name__}: {exc}")
+    print_status("下一步 / Next: " + error_guidance(exc))
 
 
 # 2. 主进程进度与有界接收队列 / Parent-side progress and bounded receive queue
@@ -167,20 +177,14 @@ class CaptureProgress:
         self.stream = stream if stream is not None else sys.stderr
         self.waiting = False
 
-    def emit(self, text):
-        try:
-            print(text, file=self.stream, flush=True)
-        except (OSError, UnicodeError, ValueError):
-            pass
-
     def wait(self):
         if not self.waiting:
             self.waiting = True
-            self.emit("[等待数据 / Waiting for data]")
+            print_status("[等待数据 / Waiting for data]", self.stream)
 
     def received(self, count):
         self.waiting = False
-        self.emit(f"[收到数据 / Data received] samples: {count}")
+        print_status(f"[收到数据 / Data received] samples: {count}", self.stream)
 
 
 class GpuEventQueue(asyncio.Queue):
@@ -554,8 +558,8 @@ class Decoder:
         self.origin = None
 
     def metadata(self, payload):
-        """0=显示定义，1=原始字段，2=JS，3=GPU 参数；公式指纹只用于记录。
-        Keys 0/1/2/3 hold display definitions/raw fields/JS/GPU parameters; the formula hash is informational only.
+        """0=显示定义，1=原始字段，2=JS，3=GPU 参数；只配置解码状态，不构造归档。
+        Keys 0/1/2/3 hold display definitions/raw fields/JS/GPU parameters; configure decoding without building an archive.
         """
         self.version += 1
         self.previous = None
@@ -572,7 +576,6 @@ class Decoder:
             source, gpu = None, {}
         else:
             raise ValueError("unknown metadata format")
-        source_hash = hashlib.sha256(source.encode()).hexdigest() if source is not None else None
         minimum = 5 if source is not None else 1
         if not self.counters or any(not isinstance(c, list) or len(c) < minimum
                                     or not isinstance(c[0], str) for c in self.counters):
@@ -591,10 +594,6 @@ class Decoder:
                 self.engine = FormulaEngine(source, gpu, self.counters, self.numer, self.denom)
             except Exception as exc:
                 self.engine_error = f"formula_initialization: {exc}"
-        return {"version": self.version, "definitions": json_safe(payload),
-                "formula_sha256": source_hash,
-                "formula_error": self.engine_error,
-                "units": {name: None for name in names}}
 
     def samples(self, count, data):
         """每条记录为 timestamp + N 个 uint64；先校验布局，再逐条生成结果。
@@ -756,7 +755,7 @@ class WindowRecord:
     baseline_count: int
     duplicate_count: int
     invalid_sample_count: int
-    adjusted_sample_count: int
+    adjusted_sample_count: int  # 读取旧结果用；当前采集恒为 0。 / Retained for old results; current captures always emit 0.
     valid_counts: dict[str, int]
     values: dict[str, float | None]
 
@@ -811,14 +810,14 @@ class WindowAggregator:
     def _reset(self):
         self.sums = dict.fromkeys(self.names, 0.0)
         self.counts = dict.fromkeys(self.names, 0)
-        self.samples = self.baselines = self.duplicates = self.invalid = self.adjusted = 0
+        self.samples = self.baselines = self.duplicates = self.invalid = 0
 
     def _emit(self, end, partial):
         eligible = self.samples - self.baselines - self.duplicates
         record = WindowRecord(
             self.bucket * self.interval, end, partial, self.samples,
             WindowRecord.quality(self.samples, eligible, self.invalid, self.counts),
-            self.baselines, self.duplicates, self.invalid, self.adjusted,
+            self.baselines, self.duplicates, self.invalid, 0,
             dict(self.counts), {n: self.sums[n] / self.counts[n] if self.counts[n] else None for n in self.names})
         record.validate(self.names)
         self.emit(record)
@@ -855,7 +854,6 @@ class WindowAggregator:
             else:
                 self.duplicates += 1
             return
-        self.adjusted += bool(sample.get("adjustments"))
         has_invalid = status != "valid"
         for name in self.names:
             value = sample["values"].get(name)
@@ -894,22 +892,22 @@ class ResultWriter:
         self.names = counter_names(counters)
         if format == "csv" and "time_ms" in self.names:
             raise ValueError("csv_time_column_conflict: time_ms")
-        self.counters, self.format = list(counters), format
+        self.format = format
         # 白名单阻止 header 中的原始消息、公式等意外落盘。
         # Allow lists prevent accidental persistence of raw metadata or formulas.
         device, session = device or {}, session or {}
         device_keys = ("name", "model", "ios_version", "gpu_name", "compatibility")
-        self.header = {"schema": RESULT_SCHEMA, "aggregation": AGGREGATION,
+        header = {"schema": RESULT_SCHEMA, "aggregation": AGGREGATION,
                        "device": {k: device[k] for k in device_keys if isinstance(device.get(k), str)},
                        "scope": "device", "source": session.get("source", "unknown"),
                        "started_at": session.get("started_at", utc_now()),
                        "report_interval": session.get("report_interval", 1.0),
                        "counters": [asdict(c) for c in counters]}
-        if (not isinstance(self.header["source"], str) or not isinstance(self.header["started_at"], str)
-                or not isinstance(self.header["report_interval"], (int, float))
-                or not math.isfinite(self.header["report_interval"]) or self.header["report_interval"] <= 0):
+        if (not isinstance(header["source"], str) or not isinstance(header["started_at"], str)
+                or not isinstance(header["report_interval"], (int, float))
+                or not math.isfinite(header["report_interval"]) or header["report_interval"] <= 0):
             raise ValueError("invalid result header")
-        header_text = dumps(self.header)
+        header_text = dumps(header)
         self.output = preflight_result_path(output, format)
         self.part = Path(str(self.output) + ".part")
         self.rows = 0
@@ -1028,14 +1026,6 @@ class ParsedPipeline:
         self.sample_span_s = 0.0
         self.sample_errors = {}
 
-    @staticmethod
-    def log_sample_error(message):
-        """错误日志不可写时仍保留质量统计和结果文件。 / Preserve quality statistics and results if error logging is unavailable."""
-        try:
-            print(message, file=sys.stderr, flush=True)
-        except (OSError, UnicodeError, ValueError):
-            pass
-
     def report_sample_error(self, sample):
         """输出有界错误提示，不让连续异常刷屏。 / Report bounded errors without flooding on repeated invalid samples."""
         reason = sample["status"]
@@ -1046,8 +1036,8 @@ class ParsedPipeline:
         if count == 1 or count % 1000 == 0:
             detail = "; ".join(f"{name}: {error}" for name, error in list(sample.get("errors", {}).items())[:3])[:256]
             action = "跳过异常指标值 / Invalid counter values skipped" if sample["values"] else "跳过异常样本 / Invalid sample skipped"
-            self.log_sample_error(f"[ERROR] {action}: reason={reason}, sample={self.sample_count + 1}, "
-                                  f"time_s={sample['elapsed_ns'] / 1e9:.6f}, count={count}; {detail}")
+            print_status(f"[ERROR] {action}: reason={reason}, sample={self.sample_count + 1}, "
+                         f"time_s={sample['elapsed_ns'] / 1e9:.6f}, count={count}; {detail}")
 
     def process(self, payload):
         try:
@@ -1096,8 +1086,8 @@ class ParsedPipeline:
         self.windows.finish()
         if self.sample_errors:
             summary = ", ".join(f"{reason}={count}" for reason, count in self.sample_errors.items())
-            self.log_sample_error(f"[ERROR] 异常数据汇总 / Invalid data summary: {summary}；"
-                                  "可用 --debug 保存原始数据 / Use --debug to retain raw data.")
+            print_status(f"[ERROR] 异常数据汇总 / Invalid data summary: {summary}；"
+                         "可用 --debug 保存原始数据 / Use --debug to retain raw data.")
         if details is not None:
             details.update(self.statistics())
         return self.writer.finish(reason, failed or self.failed, details)
@@ -1418,7 +1408,7 @@ async def collect_parsed(service, worker, output, format="csv", stop_event=None,
         await rpc("start", service.start, can_stop=True)
         if on_started:
             on_started.set()
-        print("GPU Counter 已启动 / GPU started", file=sys.stderr, flush=True)
+        print_status("GPU Counter 已启动 / GPU started")
         while True:
             now = loop.time()
             if debug is not None:
@@ -1460,7 +1450,7 @@ async def collect_parsed(service, worker, output, format="csv", stop_event=None,
         elapsed = loop.time() - started
         shutdown_started = loop.time()
         shutdown_deadline = shutdown_started + shutdown_timeout
-        print("正在停止并保存尾部数据 / Stopping and draining GPU data", file=sys.stderr, flush=True)
+        print_status("正在停止并保存尾部数据 / Stopping and draining GPU data")
         try:
             await rpc("stop", service.stop)
         except Exception as exc:
@@ -1520,11 +1510,11 @@ async def collect_parsed(service, worker, output, format="csv", stop_event=None,
         if errors and result.status == "completed":
             result.status = "partial"
         if details.get("console_error"):
-            print("终端输出已关闭 / Console disabled: " + details["console_error"], file=sys.stderr)
+            print_status("终端输出已关闭 / Console disabled: " + details["console_error"])
         for error in errors:
-            print("采集异常 / Capture error: " + error, file=sys.stderr)
+            print_status("采集异常 / Capture error: " + error)
         if errors:
-            print("下一步 / Next: " + error_guidance(RuntimeError(errors[0])), file=sys.stderr)
+            print_status("下一步 / Next: " + error_guidance(RuntimeError(errors[0])))
         return result
 
 
@@ -1581,7 +1571,7 @@ async def close_gpu_connection(dvt):
         await dvt.close()
 
 
-async def prepare_gpu(args, stack, stop, configure=True, report=None):
+async def prepare_gpu(args, stack, stop, configure=True, report=None, debug=None):
     """采集与检查共用设备服务准备，不启动任何性能采样器。
     Shared service preparation for capture and inspection; no performance sampler starts here.
     """
@@ -1602,7 +1592,6 @@ async def prepare_gpu(args, stack, stop, configure=True, report=None):
     await stage_wait(dvt.connect(), args.timeout, "dvt_connect", stop)
     checked("开发者服务 / developer service", "DVT connected")
     service = await stage_wait(dvt.dtx.open_channel(GpuService), args.timeout, "gpu_channel", stop)
-    debug = getattr(args, "debug_recorder", None)
     service.debug = debug
     info = await stage_wait(service.device_info(), args.timeout, "gpu_info", stop)
     if debug is not None:
@@ -1717,7 +1706,7 @@ async def devices_command(args):
     if not rows:
         print_error(ValueError("no_device_connected"))
     else:
-        print(f"发现 / found {len(rows)} 条连接；采集用 --udid 选择，兼容状态以 doctor/counters 为准。", file=sys.stderr)
+        print_status(f"发现 / found {len(rows)} 条连接；采集用 --udid 选择，兼容状态以 doctor/counters 为准。")
     return RunResult(None, "failed" if not rows else "partial" if failures else "completed", {"devices": rows})
 
 
@@ -1817,9 +1806,9 @@ async def inspection_command(args):
         output.writerow(["Counter", "单位 / Unit", "说明 / Description"])
         for counter in counters:
             output.writerow([counter.name, counter.unit or "unknown / 未证实", counter.description])
-        print(f"{len(counters)} 项指标；兼容 / compatibility={device['compatibility']}。只读取元数据，未保存样本。", file=sys.stderr)
+        print_status(f"{len(counters)} 项指标；兼容 / compatibility={device['compatibility']}。只读取元数据，未保存样本。")
     if args.command == "doctor" and not failed:
-        print("服务检查通过；未启动采样，不代表数据完整性或跨设备验收。下一步运行 counters 或 capture。", file=sys.stderr)
+        print_status("服务检查通过；未启动采样，不代表数据完整性或跨设备验收。下一步运行 counters 或 capture。")
     return RunResult(None, "failed" if failed else "completed", {"checks": checks})
 
 
@@ -1829,26 +1818,24 @@ async def live(args):
     """
     format = getattr(args, "format", "csv")
     preflight_result_path(args.output, format)
-    args.debug_recorder = None
     stack = contextlib.AsyncExitStack()
-    worker = None
+    worker = debug = None
     handed_off = False
     with sigint_stop_event() as stop:
         try:
             if getattr(args, "debug", False):
                 root = getattr(args, "debug_directory", None) or (Path("captures") / datetime.now().strftime("%Y%m%d_%H%M%S_%f") / "debug")
                 debug = DebugRecorder(root, args.output)
-                args.debug_recorder = debug
                 stack.push_async_callback(debug.close)
                 await stage_wait(debug.start(args.timeout), args.timeout, "debug_start", stop)
-                print(f"Debug 原始数据 / Raw debug data: {debug.root.resolve()}", file=sys.stderr, flush=True)
-            print("正在连接设备 / Connecting to device", file=sys.stderr, flush=True)
-            service, mach, device = await prepare_gpu(args, stack, stop)
-            print("兼容基线 / Compatibility: " + ("已验证设备 / verified device" if device["compatibility"] == "validated_baseline"
-                                                 else "未验证设备 / unverified device"), file=sys.stderr, flush=True)
+                print_status(f"Debug 原始数据 / Raw debug data: {debug.root.resolve()}")
+            print_status("正在连接设备 / Connecting to device")
+            service, mach, device = await prepare_gpu(args, stack, stop, debug=debug)
+            print_status("兼容基线 / Compatibility: " + ("已验证设备 / verified device" if device["compatibility"] == "validated_baseline"
+                                                 else "未验证设备 / unverified device"))
             header = make_header(int(mach[1]), int(mach[2]), args.report_interval, device)
-            if getattr(args, "debug_recorder", None) is not None:
-                args.debug_recorder.record("session", header)
+            if debug is not None:
+                debug.record("session", header)
             worker = CaptureWorker(args.output, header, format, args.console)
             await stage_wait(worker.receive(args.timeout), args.timeout, "worker_start", stop)
             # 交接前的失败由 finally 清理；交接后由 collect_parsed 负责所有收尾。
@@ -1865,7 +1852,7 @@ async def live(args):
                 try:
                     await stage_wait(stack.aclose(), min(args.timeout, 5), "initialization_cleanup")
                 except Exception as exc:
-                    print(f"初始化清理失败 / Initialization cleanup failed: {exc}", file=sys.stderr)
+                    print_status(f"初始化清理失败 / Initialization cleanup failed: {exc}")
 
 
 def run_capture(awaitable):
@@ -1886,7 +1873,7 @@ def run_capture(awaitable):
             if pending:
                 _, remaining = loop.run_until_complete(asyncio.wait(pending, timeout=1))
                 if remaining:
-                    print("后台任务取消超时 / Background cancellation timed out", file=sys.stderr)
+                    print_status("后台任务取消超时 / Background cancellation timed out")
                     if result is not None:
                         result.details.setdefault("errors", []).append("background_cancellation_timeout")
                         if result.status == "completed":
@@ -1949,17 +1936,16 @@ def main():
             result = run_capture(inspection_command(args))
         else:
             result = run_capture(live(args))
-            print(f"已保存 / Saved: {result.path.resolve() if result.path else '无结果文件 / no result file'} (status={result.status})",
-                  file=sys.stderr)
+            print_status(f"已保存 / Saved: {result.path.resolve() if result.path else '无结果文件 / no result file'} (status={result.status})")
             if result.details:
-                print(f"已解析样本 / samples={result.details.get('sample_count', 0)}，"
+                print_status(f"已解析样本 / samples={result.details.get('sample_count', 0)}，"
                       f"窗口 / rows={result.details.get('row_count', 0)}，"
-                      f"设备跨度 / span={result.details.get('sample_span_s', 0):.3f}s", file=sys.stderr)
+                      f"设备跨度 / span={result.details.get('sample_span_s', 0):.3f}s")
             if result.path and result.path.suffix == ".part":
-                print("保留了中断结果；使用 tools/recover_results.py 恢复到新路径 / Recover the .part file to a new path.", file=sys.stderr)
+                print_status("保留了中断结果；使用 tools/recover_results.py 恢复到新路径 / Recover the .part file to a new path.")
         return 0 if result.status == "completed" else 1
     except (KeyboardInterrupt, CaptureStopped):
-        print("操作已中断 / Operation interrupted", file=sys.stderr)
+        print_status("操作已中断 / Operation interrupted")
         return 130
     except Exception as exc:
         print_error(exc)
