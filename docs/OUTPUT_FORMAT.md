@@ -22,7 +22,7 @@ CSV 输出 time_ms 与 Counter 原名列；JSON 使用 ios_gpu_counter.rows.v2�
 - 计数型指标也是样本均值，不代表秒内事件总数；不额外转换为速率或时间加权利用率。
 - 有后续样本落入更晚窗口时，中间没有任何样本的窗口输出 `missing`。在首条样本前、最后样本后及等待下一批期间不推测或补造空窗。
 - 正常完整窗口的 `end_s` 为窗口右边界。结束时最后一行的 `end_s` 为最后实际观测样本时间，`partial_window=true`。若最后样本恰好落在新窗口起点，可产生 `start_s == end_s` 的尾行；它保留该边界样本，不表示覆盖了完整一秒。
-- 倒序样本计入当前尚未输出窗口的异常数，不回写历史窗口，不参与计算，也不推进尾窗时间。跨包前值仍由原 Decoder 保持。
+- 倒序样本计入当前尚未输出窗口的异常数，不回写历史窗口，不参与计算，也不推进尾窗时间。跨包前值仍由原 GpuSampleDecoder 保持。
 - 算术运算产生非有限结果时拒绝写入，不把异常转换为零。
 
 窗口使用固定全量 Counter 键及质量计数；尾窗终点为最后实际观测时间。
@@ -60,9 +60,9 @@ CSV 输出 time_ms 与 Counter 原名列；JSON 使用 ios_gpu_counter.rows.v2�
 
 `CounterDefinition` 只包含 `name / unit / description`，名称唯一、顺序固定。指标来自当前设备/profile，不固定为 30 项，不把整设备指标解释为 App 数据。
 
-当前 Decoder 尚未证实设备定义中的单位，`ParsedPipeline` 传入的 unit 为 null，不依据名称猜测；写入器可保存后续能力探测提供的已确认单位。设备公式、原始字段、formula_values 和完整服务响应不进入新格式。
+当前 GpuSampleDecoder 尚未证实设备定义中的单位，`CaptureDataPipeline` 传入的 unit 为 null，不依据名称猜测；写入器可保存后续能力探测提供的已确认单位。设备公式、原始字段、formula_values 和完整服务响应不进入新格式。
 
-同一元数据重复通知不重置跨包基线；内容发生任何变化时 ParsedPipeline.process 报 metadata_changed，正式 collect_parsed 停止消费、请求 GPU stop 并完成已有结果，不再用旧定义解析尾包。禁止中途改列或忽略新增指标。
+同一元数据重复通知不重置跨包基线；内容发生任何变化时 CaptureDataPipeline.process 报 metadata_changed，正式 CaptureSession.collect_until_stopped 停止消费、请求 GPU stop 并完成已有结果，不再用旧定义解析尾包。禁止中途改列或忽略新增指标。
 
 ## 4. CSV
 
@@ -91,7 +91,7 @@ CSV 输出 time_ms 与 Counter 原名列；JSON 使用 ios_gpu_counter.rows.v2�
 | `rows` | 逐个追加的 WindowRecord，null 表示无有效值 |
 | `result` | 收尾时写入 status、stop_reason、row_count、ended_at；现场采集路径另有 capture 摘要 |
 
-result.capture 包含 collection_elapsed_s、sample_count、sample_span_s、row_count、has_values、metadata_received、console_error、sample_errors、errors、lifecycle 和 receive_queue。sample_errors 按样本状态统计异常数量；errors 记录导致采集/收尾失败的错误，最多 16 条、每条最多 512 字符。lifecycle 仅记 start/stop/flush 状态与当时已处理样本数，不保存原始 RPC 回复。文件内计数在输出尾窗后更新。完整收尾耗时 shutdown_elapsed_s 由内存 RunResult.details/诊断报告记录，不回写已经完成的文件。
+result.capture 包含 collection_elapsed_s、sample_count、sample_span_s、row_count、has_values、metadata_received、console_error、sample_errors、errors、lifecycle 和 receive_queue。sample_errors 按样本状态统计异常数量；errors 记录导致采集/收尾失败的错误，最多 16 条、每条最多 512 字符。lifecycle 仅记 start/stop/flush 状态与当时已处理样本数，不保存原始 RPC 回复。文件内计数在输出尾窗后更新。完整收尾耗时 shutdown_elapsed_s 由内存 CommandResult.details/诊断报告记录，不回写已经完成的文件。
 
 正式采集停止原因包括 user_stop、cancelled、capture_error。具体异常阶段在 errors 中；断连/取消/解析失败/收尾错误使会话非 completed。极晚资源清理失败会使退出状态非零，但不重写已完成文件，应结合 stderr/退出码判断。
 
@@ -109,8 +109,8 @@ result.capture 包含 collection_elapsed_s、sample_count、sample_span_s、row_
 - 输出后缀必须匹配 csv/json。路径检查在写入前验证目录可创建临时文件、目标及 `.part` 不存在；实际打开仍使用排他创建。Windows 最终重命名拒绝覆盖运行期间出现的目标文件。
 - 每个窗口 flush 到操作系统；不声称 fsync 级断电保护。只保存当前窗口和固定统计量，不积累整场 rows。
 - 写入失败向调用方抛出，写入器关闭且拒绝继续写入/finish；已写 CSV 或 JSON `.part` 保留。磁盘耗尽时应先腾出空间或选择其他可写位置再恢复。
-- 终端 BrokenPipe/编码失败只关闭本次终端输出，记录 WindowOutput.console_error；文件继续写入且数据质量不受其影响。工具将终端关闭原因输出到 stderr。
-- Decoder/QuickJS 的创建和调用必须在同一线程。工具在独立工作进程内满足这一约束，IPC 队列最多一个在途请求；超时可终止该进程，保留 CSV/.part。设备通信仍在主进程，保持 stop/drain/flush 顺序。
+- 终端 BrokenPipe/编码失败只关闭本次终端输出，记录 CaptureOutput.console_error；文件继续写入且数据质量不受其影响。工具将终端关闭原因输出到 stderr。
+- GpuSampleDecoder/QuickJS 的创建和调用必须在同一线程。工具在独立工作进程内满足这一约束，IPC 队列最多一个在途请求；超时可终止该进程，保留 CSV/.part。设备通信仍在主进程，保持 stop/drain/flush 顺序。
 
 恢复命令（不连接设备）：
 

@@ -66,8 +66,8 @@ KEY_COUNTERS = {
 }
 
 
-# 阅读入口：main → live → prepare_gpu → collect_parsed → ParsedPipeline → Decoder。
-# Reading route: main → live → prepare_gpu → collect_parsed → ParsedPipeline → Decoder.
+# 阅读入口：GpuCounterApp.run → CaptureSession.run → DeviceSession.open → CaptureSession.collect_until_stopped。
+# Reading route: GpuCounterApp.run → CaptureSession.run → DeviceSession.open → CaptureSession.collect_until_stopped.
 # 主进程通信；解析子进程持有 QuickJS/结果文件；可选 Debug 子进程保存原始载荷。
 # The parent owns transport; one child owns QuickJS/results; an optional debug child archives raw payloads.
 
@@ -98,7 +98,10 @@ def dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
 
 
-def ensure_transport():
+def require_transport_dependency():
+    """在访问设备前检查 DTX 依赖；缺依赖时仍允许 CLI 帮助加载。
+    Check DTX dependencies before device access while allowing CLI help to load without them.
+    """
     if DTX_IMPORT_ERROR is not None:
         raise ImportError("pymobiledevice3: " + DTX_IMPORT_ERROR)
 
@@ -153,8 +156,8 @@ def error_guidance(exc):
 
 
 def print_status(message, stream=None):
-    """状态输出不可写时继续收尾；数据输出由 WindowOutput 单独处理。
-    Keep cleanup running if status output is unavailable; WindowOutput handles data output separately.
+    """状态输出不可写时继续收尾；数据输出由 CaptureOutput 单独处理。
+    Keep cleanup running if status output is unavailable; CaptureOutput handles data output separately.
     """
     try:
         print(message, file=stream if stream is not None else sys.stderr, flush=True)
@@ -163,13 +166,17 @@ def print_status(message, stream=None):
 
 
 def print_error(exc):
+    """显示异常所在阶段及下一步建议；不修改异常或决定采集状态。
+    Show the failing stage and next steps without modifying the exception or deciding capture
+    status.
+    """
     phase = getattr(exc, "gpu_stage", "")
     print_status(f"错误 / Error [{phase or type(exc).__name__}]: {type(exc).__name__}: {exc}")
     print_status("下一步 / Next: " + error_guidance(exc))
 
 
 # 2. 主进程进度与有界接收队列 / Parent-side progress and bounded receive queue
-class CaptureProgress:
+class CaptureStatusReporter:
     """只在等待状态切换及数据到达时提示，不定时刷新。
     Report waiting transitions and incoming data only, without periodic refresh.
     """
@@ -187,7 +194,7 @@ class CaptureProgress:
         print_status(f"[收到数据 / Data received] samples: {count}", self.stream)
 
 
-class GpuEventQueue(asyncio.Queue):
+class GpuMessageQueue(asyncio.Queue):
     """同时限制消息数与负载字节，容纳大批样本计算期间的短通知。
     Bound both message count and payload bytes, allowing short notifications during large-batch evaluation.
     """
@@ -200,6 +207,10 @@ class GpuEventQueue(asyncio.Queue):
 
     @classmethod
     def weight(cls, item):
+        """估算队列载荷预算，包含 NSError 内嵌内容；不是精确的进程内存计量。
+        Estimate the queue payload budget including nested NSError content, not exact process memory
+        usage.
+        """
         if isinstance(item, NSError):
             return 64 + cls.weight(item.code) + cls.weight(item.domain) + cls.weight(item.user_info)
         if isinstance(item, (bytes, bytearray)):
@@ -213,6 +224,9 @@ class GpuEventQueue(asyncio.Queue):
         return 64
 
     def put_nowait(self, item):
+        """同时检查消息数与字节预算；满队列抛错，不移除旧消息腾空间。
+        Check message and byte limits together; raise on overflow without evicting older messages.
+        """
         size = self.weight(item)
         if self.payload_bytes + size > self.max_bytes:
             raise asyncio.QueueFull
@@ -222,6 +236,9 @@ class GpuEventQueue(asyncio.Queue):
         self.peak_messages = max(self.peak_messages, self.qsize())
 
     def get_nowait(self):
+        """取出一条消息并释放其预算；此时消息尚不一定已完成解析。
+        Remove one message and release its budget; parsing may still be pending.
+        """
         item = super().get_nowait()
         self.payload_bytes -= self.weight(item)
         return item
@@ -231,6 +248,10 @@ class GpuEventQueue(asyncio.Queue):
 class DebugArchive:
     """仅在调试子进程写入未经解析的服务载荷。 / Write unparsed service payloads only in the debug child process."""
     def __init__(self, root, output):
+        """排他创建本次 Debug 目录及日志；已存在目录直接拒绝，避免覆盖证据。
+        Exclusively create this run's debug directory and journal; reject existing directories to
+        avoid overwriting evidence.
+        """
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=False)
         for name in ("samples", "metadata", "scripts"):
@@ -309,6 +330,10 @@ class DebugArchive:
         self.session["messages"] = sequence
 
     def close(self, state="closed", error=None):
+        """关闭日志并写最终记录状态；closed 表示原始记录结束，不代表采集质量完整。
+        Close the journal and save recording state; closed means recording ended, not complete
+        capture quality.
+        """
         self.journal.close()
         self.session.update(state=state, ended_at=utc_now())
         if error:
@@ -316,7 +341,7 @@ class DebugArchive:
         self.save_session()
 
 
-def _debug_worker_main(requests, replies, root, output):
+def _debug_writer_entry(requests, replies, root, output):
     """隔离原始文件 I/O，避免阻塞设备事件循环。 / Isolate raw file I/O from the device event loop."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     archive = None
@@ -345,11 +370,15 @@ def _debug_worker_main(requests, replies, root, output):
 class DebugRecorder:
     """有界原始记录队列；失败显式传播，不静默丢失。 / Bound raw recording and propagate failures without silent loss."""
     def __init__(self, root, output):
+        """创建并启动原始写入子进程；需 await start 确认文件初始化成功后才能使用。
+        Create and launch the raw-writer process; await start to confirm file initialization before
+        use.
+        """
         self.root = Path(root)
         ctx = multiprocessing.get_context("spawn")
         self.requests, self.replies = ctx.Queue(maxsize=2048), ctx.Queue()
         self.requests.cancel_join_thread()
-        self.process = ctx.Process(target=_debug_worker_main,
+        self.process = ctx.Process(target=_debug_writer_entry,
                                    args=(self.requests, self.replies, root, output), daemon=True)
         self.pending_bytes = 0
         self.record_count = 0
@@ -359,6 +388,10 @@ class DebugRecorder:
         self.process.start()
 
     def check(self):
+        """非阻塞读取回执、释放字节预算并传播后台失败；失败状态不会被后续检查清除。
+        Read acknowledgments without blocking, release byte budgets and propagate persistent
+        background failures.
+        """
         while True:
             try:
                 kind, value = self.replies.get_nowait()
@@ -378,6 +411,10 @@ class DebugRecorder:
             raise RuntimeError(self.failure)
 
     async def start(self, timeout=10):
+        """等待子进程 ready 回执，不再次创建进程；timeout 是等待就绪的秒数。
+        Wait for the child ready acknowledgment without launching another process; timeout is
+        readiness wait time in seconds.
+        """
         deadline = asyncio.get_running_loop().time() + timeout
         while not self.ready:
             self.check()
@@ -392,7 +429,7 @@ class DebugRecorder:
         self.check()
         if self.finished or self.disposed:
             raise RuntimeError("debug_recorder_closed")
-        size = GpuEventQueue.weight(payload)
+        size = GpuMessageQueue.weight(payload)
         try:
             if self.pending_bytes + size > self.max_bytes:
                 raise queue.Full
@@ -404,6 +441,10 @@ class DebugRecorder:
         self.record_count += 1
 
     async def close(self, timeout=5):
+        """提交最终消息数，等待所有已接受记录写完；超时/失败时仍回收子进程与队列。
+        Submit the final message count and await accepted records; reclaim the child and queues even
+        on failure or timeout.
+        """
         if self.disposed:
             return
         deadline = asyncio.get_running_loop().time() + timeout
@@ -442,7 +483,7 @@ class DebugRecorder:
 
 
 # 4. GPU 服务接口：库负责 DTX 编解码，本类只声明业务方法 / GPU API: the library owns DTX encoding; this class declares methods
-class GpuService(DTXService):
+class GpuCounterService(DTXService):
     """RPC 的 await 返回对应回复；采样通过 notification 独立到达。
     Each awaited RPC returns its reply; sample notifications arrive independently.
     """
@@ -450,7 +491,7 @@ class GpuService(DTXService):
 
     def __init__(self, ctx):
         super().__init__(ctx)
-        self.events = GpuEventQueue()
+        self.events = GpuMessageQueue()
         self.closed = asyncio.Event()
         self.failure: str | None = None
         self.debug = None
@@ -458,6 +499,8 @@ class GpuService(DTXService):
     @dtx_method("requestDeviceGPUInfo")
     async def device_info(self): ...
 
+    # 装饰器把调用编码为设备 RPC；类型声明控制协议整数宽度，函数体不是空操作。
+    # The decorator encodes a device RPC; annotations set protocol integer widths, so the stub is not a no-op.
     @dtx_method("configureCounters:counterProfile:interval:windowLimit:tracingPID:")
     async def configure(self, accelerator: PInt64, profile: PInt64, interval: PInt64,
                         window: PInt64, pid: PInt32): ...
@@ -465,13 +508,19 @@ class GpuService(DTXService):
     @dtx_method("startCollectingCounters")
     async def start(self): ...
 
+    # stop 后仍须排空已收通知并 flush；仅收到 stop 回复不能证明尾部已经到齐。
+    # Drain notifications and flush after stop; a stop reply alone does not prove the tail has arrived.
     @dtx_method("stopCollectingCounters")
     async def stop(self): ...
 
+    # 仅在停止流程调用，返回值可能包含多个尾包。 / Call only during shutdown; the reply may contain multiple tail messages.
     @dtx_method("flushRemainingData")
     async def flush(self): ...
 
     def enqueue(self, payload):
+        """原始记录先入 Debug 队列，再入解析队列；任一队列失败会通知会话停止。
+        Queue raw recording before parsing; failure in either queue signals the session to stop.
+        """
         if self.debug is not None:
             try:
                 self.debug.record("notification", payload)
@@ -486,6 +535,10 @@ class GpuService(DTXService):
 
     @dtx_on_notification
     async def notification(self, payload):
+        """接收库已解码的异步服务载荷；这里仅入队，不执行设备公式。
+        Receive asynchronously delivered, library-decoded payloads; enqueue only, without executing
+        formulas.
+        """
         self.enqueue(payload)
 
     @dtx_on_dispatch
@@ -495,18 +548,25 @@ class GpuService(DTXService):
         self.enqueue({"dispatch_selector": selector, "arguments": list(args)})
 
     def on_closed(self, reason=""):
+        """保存关闭原因并唤醒会话；已经接收的消息仍留在队列中等待收尾。
+        Store the close reason and notify the session while retaining queued messages for draining.
+        """
         self.failure = self.failure or (reason or "connection_closed")
         # 不清除已经接收的样本。 / Never purge already received samples.
         self.closed.set()
 
 
 # 5. 从样本字节到指标值 / From sample bytes to metric values
-class FormulaEngine:
+class DeviceFormulaEvaluator:
     """仅在采集管线的专用工作线程中创建和使用。
     Created and used only on the pipeline's dedicated worker thread.
     """
 
     def __init__(self, source, gpu_info, counters, numer, denom):
+        """在解析进程的同一线程创建 QuickJS，加载设备参数和源码并限制资源；只调用定义表选定的函数。
+        Create QuickJS on the parsing thread, load device inputs/source and bound resources; call
+        only definition-selected functions.
+        """
         import quickjs
         self.context = quickjs.Context()
         self.context.set_memory_limit(64 * 1024 * 1024)
@@ -541,9 +601,9 @@ class FormulaEngine:
         return json.loads(self.run(dumps({"globals": values, "functions": self.functions})))
 
 
-class Decoder:
-    """跨包保存前值：元数据绑定字段，samples 解包，再准备输入和执行公式。
-    Retain previous records across packets: metadata binds fields, samples unpacks, then inputs and formulas run.
+class GpuSampleDecoder:
+    """跨包保存前值：configure_metadata 绑定字段，decode_samples 解包并计算指标。
+    Retain previous records across packets: configure_metadata binds fields and decode_samples unpacks and computes metrics.
     """
     def __init__(self, numer: int, denom: int):
         if numer <= 0 or denom <= 0:
@@ -557,9 +617,10 @@ class Decoder:
         self.previous = None
         self.origin = None
 
-    def metadata(self, payload):
-        """0=显示定义，1=原始字段，2=JS，3=GPU 参数；只配置解码状态，不构造归档。
-        Keys 0/1/2/3 hold display definitions/raw fields/JS/GPU parameters; configure decoding without building an archive.
+    def configure_metadata(self, payload):
+        """配置字段、显示定义和公式；0/1/2/3 分别为显示定义/原始字段/JS/GPU 参数。重置跨包前值，返回 None。
+        Configure display definitions, raw fields, JS and GPU parameters from keys 0/1/2/3. Reset
+        previous-record state and return None.
         """
         self.version += 1
         self.previous = None
@@ -591,13 +652,15 @@ class Decoder:
             if len(set(variables)) != len(variables):
                 raise ValueError("ambiguous normalized variable names")
             try:
-                self.engine = FormulaEngine(source, gpu, self.counters, self.numer, self.denom)
+                self.engine = DeviceFormulaEvaluator(source, gpu, self.counters, self.numer, self.denom)
             except Exception as exc:
                 self.engine_error = f"formula_initialization: {exc}"
 
-    def samples(self, count, data):
-        """每条记录为 timestamp + N 个 uint64；先校验布局，再逐条生成结果。
-        Each record is timestamp plus N uint64 values; validate its layout before yielding per-sample results.
+    def decode_samples(self, count, data):
+        """按 count 和字段数校验小端 uint64 字节长度，逐条生成样本字典并保留跨包前值。布局损坏抛错；数值异常通过 status/errors 返回。
+        Validate little-endian uint64 byte length against count/fields, yield sample dictionaries
+        and retain cross-packet state. Malformed layouts raise; numeric failures return
+        status/errors.
         """
         if self.counters is None:
             raise ValueError("samples_before_metadata")
@@ -733,7 +796,11 @@ class CounterDefinition:
     description: str = ""
 
 
-def counter_names(counters):
+def validate_counter_definitions(counters):
+    """检查名称唯一及定义类型，返回保持设备顺序的名称列表；写入器与聚合器共用此契约。
+    Validate unique names and definition types, returning device-ordered names shared by writers and
+    aggregators.
+    """
     names = [c.name for c in counters]
     if not names or len(set(names)) != len(names):
         raise ValueError("empty or duplicate counter definitions")
@@ -760,6 +827,10 @@ class WindowRecord:
     values: dict[str, float | None]
 
     def validate(self, names):
+        """校验时间、字段集合、有效分母和质量状态一致性；写入与恢复都使用相同检查。
+        Validate consistency of time, field sets, denominators and quality for both writing and
+        recovery.
+        """
         if (not all(isinstance(t, (int, float)) and not isinstance(t, bool)
                     and math.isfinite(t) for t in (self.start_s, self.end_s))
                 or not 0 <= self.start_s <= self.end_s or type(self.partial_window) is not bool):
@@ -786,6 +857,10 @@ class WindowRecord:
 
     @staticmethod
     def quality(samples, eligible, invalid, counts):
+        """依据样本数与各指标有效数判断窗口质量，独立于尾窗是否满一秒。
+        Derive window quality from sample and per-counter valid counts, independently of tail-window
+        duration.
+        """
         if samples == 0:
             return "missing"
         if not any(counts.values()):
@@ -800,7 +875,7 @@ class WindowAggregator:
     def __init__(self, counters, emit, interval=1.0):
         if not math.isfinite(interval) or interval <= 0:
             raise ValueError("invalid report interval")
-        self.names = counter_names(counters)
+        self.names = validate_counter_definitions(counters)
         self.interval, self.emit = interval, emit
         self.bucket = None
         self.last_time = None
@@ -824,6 +899,10 @@ class WindowAggregator:
         self._reset()
 
     def add(self, sample):
+        """按设备相对结束时间归入窗口；仅累计有效指标值，后续样本才确认空窗，倒序记录不回写历史。
+        Bucket by device-relative sample end time; sum valid values, confirm gaps only with later
+        samples and never rewrite past windows for reversed records.
+        """
         if self.finished:
             raise ValueError("aggregator already finished")
         timestamp = sample["elapsed_ns"] / 1e9
@@ -866,12 +945,15 @@ class WindowAggregator:
         self.invalid += has_invalid
 
     def finish(self):
+        """只输出一次当前尾窗，结束时间取最后观测值；不补造最后样本之后的数据。
+        Emit the current tail once, ending at the last observation without inventing later data.
+        """
         if not self.finished and self.bucket is not None:
             self._emit(self.last_time, True)
         self.finished = True
 
 
-def preflight_result_path(output, format):
+def check_output_path(output, format):
     """连接前可调用的路径检查，不覆盖目标。 / Pre-connection path check without overwriting targets."""
     output = Path(output)
     if format not in ("csv", "json") or output.suffix.lower() != "." + format:
@@ -889,7 +971,11 @@ class ResultWriter:
     """流式保存解析结果；内存不保留历史窗口。 / Stream parsed results without retaining past windows."""
 
     def __init__(self, output, format, counters, device=None, session=None):
-        self.names = counter_names(counters)
+        """验证输出路径与字段，排他打开 CSV 或 JSON .part；仅保存窗口结果，不持有整场记录。
+        Validate the path/fields and exclusively open CSV or JSON .part; persist windows without
+        retaining the full recording.
+        """
+        self.names = validate_counter_definitions(counters)
         if format == "csv" and "time_ms" in self.names:
             raise ValueError("csv_time_column_conflict: time_ms")
         self.format = format
@@ -908,7 +994,7 @@ class ResultWriter:
                 or not math.isfinite(header["report_interval"]) or header["report_interval"] <= 0):
             raise ValueError("invalid result header")
         header_text = dumps(header)
-        self.output = preflight_result_path(output, format)
+        self.output = check_output_path(output, format)
         self.part = Path(str(self.output) + ".part")
         self.rows = 0
         self.last_end = None
@@ -929,6 +1015,10 @@ class ResultWriter:
             raise
 
     def write(self, record):
+        """先校验完整窗口再写入并 flush；写盘失败后关闭文件，禁止继续写入或完成。
+        Validate a complete window before writing/flushing; close on write failure and reject
+        further writes or finalization.
+        """
         if self.finished or self.poisoned or self.handle.closed:
             raise ValueError("writer is closed or failed")
         record.validate(self.names)
@@ -962,6 +1052,10 @@ class ResultWriter:
             record.status == "unavailable" and record.baseline_count + record.duplicate_count == record.sample_count)
 
     def finish(self, reason="finished", failed=False, details=None):
+        """根据有效值与质量确定状态，写 JSON 尾部并完成重命名；返回 CommandResult，不覆盖已有文件。
+        Derive status from valid values/quality, write the JSON footer and rename; return
+        CommandResult without overwriting existing files.
+        """
         if self.finished or self.poisoned or self.handle.closed:
             raise ValueError("writer is closed or failed")
         status = "failed" if not self.has_values else "partial" if failed or self.bad else "completed"
@@ -979,13 +1073,17 @@ class ResultWriter:
                 raise FileExistsError(self.output)
             self.part.rename(self.output)
         self.finished = True
-        return RunResult(self.output, status)
+        return CommandResult(self.output, status)
 
     def close(self):
+        """仅释放文件句柄，不补尾部、不重命名；异常路径可保留 .part 供恢复。
+        Release the handle without adding a footer or renaming; failure paths may retain .part for
+        recovery.
+        """
         self.handle.close()
 
 
-class WindowOutput:
+class CaptureOutput:
     """先落文件再显示同一结果；终端故障不改变数据质量。
     Persist before displaying the same record; console failures do not change data quality.
     """
@@ -998,6 +1096,10 @@ class WindowOutput:
         self.console_error = None
 
     def emit(self, record):
+        """先持久化 WindowRecord，再向 stdout 显示所选指标；终端失败仅禁用展示，文件仍保留。
+        Persist WindowRecord before displaying selected metrics on stdout; terminal failure disables
+        display while retaining the file.
+        """
         self.writer.write(record)
         if self.console == "none" or self.console_error:
             return
@@ -1011,14 +1113,14 @@ class WindowOutput:
             self.console_error = type(exc).__name__
 
 
-class ParsedPipeline:
+class CaptureDataPipeline:
     """解析输出管线，负责指标解码与窗口写入；不写原始归档。
     Parsed output pipeline for metric decoding and window writing; no raw archive.
     """
     def __init__(self, output, header, format="csv", console="key", stream=None):
-        self.path = preflight_result_path(output, format)
+        self.path = check_output_path(output, format)
         self.header, self.format, self.console, self.stream = header, format, console, stream
-        self.decoder = Decoder(**header["timebase"])
+        self.decoder = GpuSampleDecoder(**header["timebase"])
         self.writer = self.windows = self.output = None
         self.metadata_hash = None
         self.failed = False
@@ -1040,6 +1142,10 @@ class ParsedPipeline:
                          f"time_s={sample['elapsed_ns'] / 1e9:.6f}, count={count}; {detail}")
 
     def process(self, payload):
+        """处理一条元数据、采样或控制载荷；处理异常会记为会话失败并向调用者传播。
+        Process one metadata, sample or control payload; mark processing failure and propagate it to
+        the caller.
+        """
         try:
             self._process(payload)
         except Exception:
@@ -1062,17 +1168,17 @@ class ParsedPipeline:
                 if signature != self.metadata_hash:
                     raise ValueError("metadata_changed")
                 return
-            self.decoder.metadata(body)
+            self.decoder.configure_metadata(body)
             counters = [CounterDefinition(c[0], description=c[2] if len(c) > 2 and isinstance(c[2], str) else "")
                         for c in self.decoder.counters]
             self.writer = ResultWriter(self.path, self.format, counters, self.header.get("device"), self.header["session"])
-            self.output = WindowOutput(self.writer, self.console, self.stream)
+            self.output = CaptureOutput(self.writer, self.console, self.stream)
             self.windows = WindowAggregator(counters, self.output.emit, self.header["session"]["report_interval"])
             self.metadata_hash = signature
         elif kind == 1:
             if self.windows is None:
                 raise ValueError("samples_before_metadata")
-            for sample in self.decoder.samples(count, body):
+            for sample in self.decoder.decode_samples(count, body):
                 self.report_sample_error(sample)
                 self.windows.add(sample)
                 self.sample_count += 1
@@ -1081,6 +1187,10 @@ class ParsedPipeline:
             raise ValueError("unsupported_gpu_message_type")
 
     def finish(self, reason="finished", failed=False, details=None):
+        """输出尾窗和异常汇总，将最终统计写入 details，再完成结果文件；必须已收到元数据。
+        Emit the tail/error summary, update details with final statistics and finalize the result;
+        metadata must already exist.
+        """
         if self.writer is None:
             raise ValueError("no_counter_metadata")
         self.windows.finish()
@@ -1093,6 +1203,10 @@ class ParsedPipeline:
         return self.writer.finish(reason, failed or self.failed, details)
 
     def statistics(self):
+        """返回已处理记录和已写窗口的摘要；sample_count 包含异常/基线，不是有效值数量。
+        Return processed-record and written-window statistics; sample_count includes
+        invalid/baseline records, not just valid values.
+        """
         return {"sample_count": self.sample_count, "sample_span_s": self.sample_span_s,
                 "metadata_received": self.metadata_hash is not None,
                 "row_count": self.writer.rows if self.writer else 0,
@@ -1142,13 +1256,16 @@ def recover_result_json(source, output):
 
 # 7. 停止事件、超时与解析工作进程 / Stop events, timeouts and the parsing worker process
 @dataclass
-class RunResult:
+class CommandResult:
+    """命令结果：path 可为空，status 决定退出码，details 保存已处理统计与错误。
+    Command outcome: path may be absent, status determines the exit code, and details holds statistics/errors.
+    """
     path: Path | None
     status: str
     details: dict = field(default_factory=dict)
 
 
-def make_header(numer=1, denom=1, report_interval=1.0, device=None, source="device"):
+def build_session_metadata(numer=1, denom=1, report_interval=1.0, device=None, source="device"):
     """创建内部会话配置；ResultWriter 仅导出公开格式允许的字段。
     Build internal session configuration; ResultWriter exports only public-format fields.
     """
@@ -1160,7 +1277,7 @@ def make_header(numer=1, denom=1, report_interval=1.0, device=None, source="devi
 
 
 @contextlib.contextmanager
-def sigint_stop_event():
+def capture_stop_signal():
     """兼容 Windows 的信号桥接，不依赖仅 Unix 支持的 add_signal_handler。
     Windows-compatible signal bridge; no Unix-only add_signal_handler required.
     """
@@ -1178,7 +1295,7 @@ class CaptureStopped(Exception):
     """初始化阶段的用户停止。 / User stop during initialization."""
 
 
-async def stage_wait(awaitable, timeout, stage, stop=None):
+async def wait_for_stage(awaitable, timeout, stage, stop=None):
     """给异步阶段设预算；不无限等待取消清理。 / Bound async stages without unbounded cancellation waits."""
     if timeout <= 0 or (stop is not None and stop.is_set()):
         if asyncio.isfuture(awaitable):
@@ -1210,7 +1327,7 @@ async def stage_wait(awaitable, timeout, stage, stop=None):
             task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
 
 
-def _capture_worker_main(requests, replies, output, header, format, console):
+def _sample_worker_entry(requests, replies, output, header, format, console):
     """解析子进程单线程持有 QuickJS 与结果文件；原始记录由独立 Debug 进程负责。
     One parsing-child thread owns QuickJS/results; a separate debug process owns raw recording.
     """
@@ -1222,7 +1339,7 @@ def _capture_worker_main(requests, replies, output, header, format, console):
             stream.reconfigure(encoding="utf-8")
     pipeline = None
     try:
-        pipeline = ParsedPipeline(output, header, format, console)
+        pipeline = CaptureDataPipeline(output, header, format, console)
         replies.put({"ok": True, "statistics": pipeline.statistics()})
         while True:
             command, args = requests.get()
@@ -1248,15 +1365,19 @@ def _capture_worker_main(requests, replies, output, header, format, console):
             pipeline.close()
 
 
-class CaptureWorker:
+class SampleProcessingWorker:
     """单个在途请求；超时后可终止工作进程，避免文件 I/O 挂住退出。
     One request in flight; terminate the worker on timeout rather than hang on file I/O.
     """
     def __init__(self, output, header, format, console):
+        """用 Windows spawn 启动解析进程；子进程内部创建 QuickJS/文件，父进程只持有队列与统计。
+        Spawn the parser process; the child creates QuickJS/files while the parent holds only queues
+        and statistics.
+        """
         ctx = multiprocessing.get_context("spawn")
         self.requests, self.replies = ctx.Queue(maxsize=1), ctx.Queue(maxsize=1)
         self.requests.cancel_join_thread()
-        self.process = ctx.Process(target=_capture_worker_main,
+        self.process = ctx.Process(target=_sample_worker_entry,
                                    args=(self.requests, self.replies, output, header, format, console), daemon=True)
         self.statistics = {"sample_count": 0, "sample_span_s": 0, "row_count": 0,
                            "has_values": False, "metadata_received": False, "console_error": None}
@@ -1265,6 +1386,10 @@ class CaptureWorker:
         self.process.start()
 
     async def receive(self, timeout):
+        """在秒级预算内等待就绪或请求回复并更新统计；退出/超时将通道标为不可继续使用。
+        Await readiness or a reply within a seconds-based budget and update statistics; process
+        exit/timeout marks the channel unusable.
+        """
         deadline = asyncio.get_running_loop().time() + timeout
         while True:
             try:
@@ -1284,6 +1409,10 @@ class CaptureWorker:
             return response.get("result")
 
     async def call(self, command, *args, timeout=10):
+        """发送一个命令并等其回复，同一实例只允许一个在途请求；取消后不再复用该通道。
+        Send one command and await its reply, allowing only one in-flight request per instance; do
+        not reuse the channel after cancellation.
+        """
         if timeout <= 0:
             raise TimeoutError("capture_worker_budget_exhausted")
         if self.broken:
@@ -1296,6 +1425,10 @@ class CaptureWorker:
             raise
 
     async def close(self):
+        """回收进程和队列，不代替 finish；调用方应先请求完成结果，失败时可强制终止进程。
+        Reclaim the process/queues without replacing finish; callers first request result
+        finalization and may terminate on failure.
+        """
         if self.closed:
             return
         if self.process.is_alive():
@@ -1313,7 +1446,7 @@ class CaptureWorker:
         self.closed = True
 
 
-def processing_chunks(payload, limit=512):
+def split_sample_batch(payload, limit=512):
     """仅分割主机解码工作，保持设备记录原序；不改变采样或网络协议。
     Split host decoding work in record order without changing sampling or the wire protocol.
     """
@@ -1332,313 +1465,7 @@ def processing_chunks(payload, limit=512):
         yield chunk
 
 
-# 8. 采集生命周期：启动 → 消费 → 停止/排空/取尾 → 完成文件 / Capture lifecycle: start → consume → stop/drain/flush → finalize
-async def collect_parsed(service, worker, output, format="csv", stop_event=None,
-                         timeout=10, idle_timeout=30, drain_timeout=2, shutdown_timeout=25,
-                         cleanup=None, on_started=None):
-    """正式采集生命周期；收尾共享预算，错误不能跳过停止或关闭。
-    Production lifecycle with a shared shutdown budget and unconditional stop/close attempts.
-    """
-    loop = asyncio.get_running_loop()
-    stop = stop_event or asyncio.Event()
-    started = last_message = loop.time()
-    reason, errors, lifecycle = "user_stop", [], []
-    processing_ok = True
-    pending_chunks = None
-    shutdown_deadline = None
-    progress = CaptureProgress()
-    debug = getattr(service, "debug", None)
-
-    def failure(stage, exc):
-        if len(errors) < 16:
-            errors.append(f"{stage}: {type(exc).__name__}: {exc}"[:512])
-
-    def budget():
-        return max(0, min(timeout, shutdown_deadline - loop.time())) if shutdown_deadline else timeout
-
-    async def rpc(name, operation, can_stop=False):
-        try:
-            reply = await stage_wait(operation(), budget(), name, stop if can_stop else None)
-            if debug is not None:
-                debug.record("rpc." + name, reply)
-            if isinstance(reply, NSError):
-                raise ValueError(f"device_error: {reply.domain}/{reply.code}")
-            lifecycle.append({"stage": name, "status": "ok", "samples_processed": worker.statistics["sample_count"]})
-            return reply
-        except BaseException:
-            lifecycle.append({"stage": name, "status": "error", "samples_processed": worker.statistics["sample_count"]})
-            raise
-
-    async def process(payload, interruptible=False, announce=True):
-        """整批消息仅提示一次，按子批等待工作进程；中断时保留尚未处理部分。
-        Announce once per packet and await worker chunks; retain the unprocessed remainder on interruption.
-        """
-        nonlocal processing_ok, pending_chunks
-        if not processing_ok:
-            return
-        if (announce and isinstance(payload, list) and len(payload) >= 5 and payload[0] == 1
-                and type(payload[3]) is int and payload[3] > 0):
-            progress.received(payload[3])
-        try:
-            chunks = iter(processing_chunks(payload))
-            for chunk in chunks:
-                await worker.call("process", chunk, timeout=budget())
-                if interruptible and (stop.is_set() or service.closed.is_set()):
-                    # 当前子批确认后立即允许 stop；剩余早期记录必须先于后续通知和 flush 解码。
-                    # Allow stop after the current chunk; decode its remainder before later notifications and flush.
-                    pending_chunks = chunks
-                    return False
-            return True
-        except Exception:
-            processing_ok = False
-            raise
-
-    async def drain(grace):
-        until = min(shutdown_deadline, loop.time() + grace)
-        while processing_ok and (not service.events.empty() or (loop.time() < until and not service.closed.is_set())):
-            if loop.time() >= shutdown_deadline:
-                raise TimeoutError("drain_budget_exhausted")
-            try:
-                payload = await asyncio.wait_for(service.events.get(), min(.1, max(.001, until - loop.time())))
-            except asyncio.TimeoutError:
-                continue
-            await process(payload)
-
-    try:
-        await rpc("start", service.start, can_stop=True)
-        if on_started:
-            on_started.set()
-        print_status("GPU Counter 已启动 / GPU started")
-        while True:
-            now = loop.time()
-            if debug is not None:
-                debug.check()
-            if stop.is_set():
-                reason = "user_stop"
-                break
-            if service.closed.is_set():
-                raise ConnectionError(service.failure or "connection_closed")
-            if not worker.statistics["metadata_received"] and now - started > timeout:
-                raise TimeoutError("metadata_timeout")
-            if not worker.statistics["sample_count"] and now - started > max(120, timeout):
-                raise TimeoutError("first_sample_timeout")
-            if service.events.empty() and now - last_message >= idle_timeout:
-                raise TimeoutError("notification_idle_timeout")
-            if service.events.empty():
-                progress.wait()
-            try:
-                payload = await asyncio.wait_for(service.events.get(), .1)
-            except asyncio.TimeoutError:
-                continue
-            last_message = loop.time()
-            if not await process(payload, interruptible=True):
-                if service.closed.is_set() and not stop.is_set():
-                    raise ConnectionError(service.failure or "connection_closed")
-                break
-    except CaptureStopped:
-        reason = "user_stop"
-    except asyncio.CancelledError as exc:
-        reason = "cancelled"
-        failure("capture", exc)
-        processing_ok = not worker.broken
-    except Exception as exc:
-        reason = "capture_error"
-        failure("capture", exc)
-    finally:
-        # 不论用户停止还是采集错误，都尝试相同的有界收尾；错误累计后影响最终状态。
-        # User stop and capture errors share bounded cleanup; accumulated errors affect final status.
-        elapsed = loop.time() - started
-        shutdown_started = loop.time()
-        shutdown_deadline = shutdown_started + shutdown_timeout
-        print_status("正在停止并保存尾部数据 / Stopping and draining GPU data")
-        try:
-            await rpc("stop", service.stop)
-        except Exception as exc:
-            failure("stop", exc)
-        try:
-            if pending_chunks is not None and processing_ok:
-                for chunk in pending_chunks:
-                    await process(chunk, announce=False)
-            await drain(drain_timeout)
-            # 只有早期消息全部解码后才能取尾；解析失效时保留已有结果并停止消费。
-            # Fetch the tail only after earlier messages; stop consuming after parsing becomes invalid.
-            if processing_ok:
-                remaining = await rpc("flush", service.flush)
-                if isinstance(remaining, list) and (not remaining or isinstance(remaining[0], list)):
-                    for message in remaining:
-                        await process(message)
-                elif remaining is not None:
-                    await process(remaining)
-                await drain(drain_timeout)
-        except Exception as exc:
-            failure("drain_or_flush", exc)
-        if service.failure:
-            failure("service", ConnectionError(service.failure))
-        if cleanup is not None:
-            try:
-                await stage_wait(cleanup(), budget(), "connection_close")
-            except Exception as exc:
-                failure("connection_close", exc)
-        stats = dict(worker.statistics)
-        if elapsed >= 5 and stats["sample_span_s"] < elapsed - 2:
-            failure("coverage", ValueError(f"samples={stats['sample_span_s']:.3f}s, collection={elapsed:.3f}s"))
-        details = {"stop_reason": reason, "collection_elapsed_s": elapsed, **stats,
-                   "errors": errors, "lifecycle": lifecycle}
-        if isinstance(service.events, GpuEventQueue):
-            details["receive_queue"] = {"peak_messages": service.events.peak_messages,
-                                        "peak_payload_bytes": service.events.peak_bytes,
-                                        "max_messages": service.events.maxsize,
-                                        "max_payload_bytes": service.events.max_bytes}
-        result = None
-        try:
-            if worker.broken or loop.time() >= shutdown_deadline:
-                raise TimeoutError("finalization_budget_exhausted_or_worker_unavailable")
-            saved = await worker.call("finish", reason, bool(errors), details, timeout=budget())
-            details.update(worker.statistics)
-            result = RunResult(Path(saved["path"]), saved["status"], details)
-        except Exception as exc:
-            failure("finalize", exc)
-        finally:
-            try:
-                await worker.close()
-            except Exception as exc:
-                failure("worker_close", exc)
-        if result is None:
-            path = Path(output) if Path(output).exists() else Path(str(output) + ".part")
-            result = RunResult(path if path.exists() else None, "partial" if stats["has_values"] else "failed", details)
-        details["shutdown_elapsed_s"] = loop.time() - shutdown_started
-        if errors and result.status == "completed":
-            result.status = "partial"
-        if details.get("console_error"):
-            print_status("终端输出已关闭 / Console disabled: " + details["console_error"])
-        for error in errors:
-            print_status("采集异常 / Capture error: " + error)
-        if errors:
-            print_status("下一步 / Next: " + error_guidance(RuntimeError(errors[0])))
-        return result
-
-
-# 9. 设备连接与初始化：只编排库接口 / Device connection and initialization: orchestrate library APIs only
-@contextlib.asynccontextmanager
-async def connect_device(args):
-    """仅对上游公开 API 做轻量编排，此处不实现传输协议。
-    Thin orchestration of upstream public APIs; no transport implementation here.
-    """
-    ensure_transport()
-    from pymobiledevice3.lockdown import create_using_usbmux
-    from pymobiledevice3.remote.rsd_tunnel import PreferredRsdTunnel
-    from pymobiledevice3 import usbmux
-
-    async with contextlib.AsyncExitStack() as stack:
-        # 显式 UDID 优先；没有选择时只接受唯一 USB 设备。 / Prefer an explicit UDID; otherwise require exactly one USB device.
-        serial = args.udid
-        if not serial:
-            devices = await usbmux.select_devices_by_connection_type(connection_type="USB")
-            if len(devices) != 1:
-                raise ValueError("no_device_connected" if not devices else
-                                 "multiple_devices: " + ", ".join(d.serial for d in devices))
-            serial = devices[0].serial
-        kwargs = {"serial": serial}
-        if getattr(args, "command", None) == "doctor":
-            kwargs["autopair"] = False
-        lockdown = await stack.enter_async_context(await create_using_usbmux(**kwargs))
-        if getattr(lockdown, "paired", True) is False:
-            raise ValueError("trust_required")
-
-        # 版本决定传输入口，协议细节交给库；这不是指标数值特判。
-        # OS version selects the transport; the library owns protocol details, not metric corrections.
-        if int(lockdown.product_version.split(".")[0]) >= 17:
-            provider = await stack.enter_async_context(PreferredRsdTunnel(serial=serial))
-        else:
-            provider = lockdown
-        if args.udid and provider.udid != args.udid:
-            raise ValueError("selected_device_mismatch")
-        yield provider
-
-
-async def close_gpu_connection(dvt):
-    """先停读再交给库关闭，避免已完成的读回调在库 feed_eof 后继续投递。
-    Pause reads before library teardown so completed reads cannot deliver data after its feed_eof.
-    """
-    try:
-        connection = getattr(dvt, "_dtx", None)
-        writer = getattr(connection, "_writer", None)
-        if writer is not None:
-            # _writer 来自锁定的 pymobiledevice3 版本；实际停止读取使用 asyncio 公共接口。
-            # _writer belongs to the pinned pymobiledevice3 version; pausing uses asyncio's public API.
-            writer.transport.pause_reading()
-    finally:
-        await dvt.close()
-
-
-async def prepare_gpu(args, stack, stop, configure=True, report=None, debug=None):
-    """采集与检查共用设备服务准备，不启动任何性能采样器。
-    Shared service preparation for capture and inspection; no performance sampler starts here.
-    """
-    ensure_transport()
-    from pymobiledevice3.services.dvt.instruments.dvt_provider import DvtProvider
-    from pymobiledevice3.services.dvt.instruments.device_info import DeviceInfo
-    from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
-
-    def checked(stage, detail):
-        if report:
-            report(stage, "ok", detail)
-
-    provider = await stage_wait(stack.enter_async_context(connect_device(args)), args.connect_timeout, "connect", stop)
-    model = getattr(provider, "product_type", None)
-    checked("设备连接与信任 / connection", f"{model or 'unknown'} / iOS {provider.product_version}")
-    dvt = DvtProvider(provider)
-    stack.push_async_callback(close_gpu_connection, dvt)
-    await stage_wait(dvt.connect(), args.timeout, "dvt_connect", stop)
-    checked("开发者服务 / developer service", "DVT connected")
-    service = await stage_wait(dvt.dtx.open_channel(GpuService), args.timeout, "gpu_channel", stop)
-    service.debug = debug
-    info = await stage_wait(service.device_info(), args.timeout, "gpu_info", stop)
-    if debug is not None:
-        debug.record("rpc.device_info", info)
-    candidates = info if isinstance(info, list) else [info]
-    if not candidates or any(not isinstance(c, dict) for c in candidates):
-        raise ValueError("invalid_gpu_device_info")
-    if len(candidates) != 1:
-        raise ValueError("multiple_gpu_candidates: " + ", ".join(str(c.get("accelerator-id")) for c in candidates))
-    gpu = candidates[0]
-    profiles = gpu.get("supported-counter-profiles")
-    if profiles is not None and args.counter_profile not in profiles:
-        raise ValueError(f"unsupported_counter_profile: requested={args.counter_profile}, supported={profiles}")
-    checked("GPU 能力 / GPU capability", f"{gpu.get('device-name', 'unknown')}, profiles={profiles or 'unknown'}")
-    device_info = await stage_wait(stack.enter_async_context(DeviceInfo(dvt)), args.timeout, "timebase_channel", stop)
-    mach = await stage_wait(device_info.mach_time_info(), args.timeout, "mach_timebase", stop)
-    if debug is not None:
-        debug.record("rpc.mach_time_info", mach)
-    if len(mach) < 3 or int(mach[1]) <= 0 or int(mach[2]) <= 0:
-        raise ValueError("invalid_mach_timebase")
-    checked("设备时间基准 / timebase", f"{mach[1]}/{mach[2]}")
-    if configure:
-        reply = await stage_wait(service.configure(PInt64(gpu["accelerator-id"]), PInt64(args.counter_profile),
-                                                   PInt64(args.sampling_interval), PInt64(args.window_limit), PInt32(-1)),
-                                 args.timeout, "configure", stop)
-        if debug is not None:
-            debug.record("rpc.configure", reply)
-        if isinstance(reply, NSError) or reply is False:
-            raise ValueError("gpu_configuration_rejected")
-    # 仅标注既有验收范围，不选择公式、不修正数值，也不拒绝其他设备。
-    # Label prior acceptance scope only; never select formulas, correct values or reject other devices here.
-    verified = (model == "iPhone14,2" and provider.product_version == "18.5" and gpu.get("device-name") == "A15"
-                and args.counter_profile == 3 and args.sampling_interval == 0 and args.window_limit == -1)
-    device = {"model": model, "ios_version": provider.product_version, "gpu_name": gpu.get("device-name"),
-              "compatibility": "validated_baseline" if verified else "unverified"}
-    checked("兼容范围 / compatibility", "已验证基线 / validated baseline" if verified else "未验证 / unverified")
-    if isinstance(provider, RemoteServiceDiscoveryService) and provider.lockdown is not None:
-        # GPU 已有独立 DTX 通道，后续服务端口来自缓存的 RSD 信息，不再使用远程 lockdown 查询。
-        # GPU owns a separate DTX channel; cached RSD discovery suffices without further remote lockdown queries.
-        # 在初始化结束时调用库的幂等 close，避免把闲置连接保留至长采集结束后才关闭。
-        # Use the library's idempotent close at initialization instead of retaining an idle connection until teardown.
-        await stage_wait(provider.lockdown.close(), args.timeout, "initial_remote_lockdown_close", stop)
-    return service, mach, device
-
-
-# 10. 用户命令与程序入口 / User commands and program entrypoint
-def local_checks():
+def check_runtime_requirements():
     """只读依赖诊断，使用当前解释器，不安装组件。 / Read-only checks of the active interpreter, without installation."""
     checks = [("Python", "ok" if sys.version_info[:2] == (3, 12) else "warning" if sys.version_info[:2] > (3, 12)
                else "failed", sys.version.split()[0] + " / " + sys.executable),
@@ -1662,294 +1489,724 @@ def local_checks():
     return checks
 
 
-async def devices_command(args):
-    """保留不可读取设备的 UDID，单台失败不隐去其他设备。
-    Retain unreadable devices' UDIDs; one failed lookup must not hide other devices.
-    """
-    ensure_transport()
-    from pymobiledevice3 import usbmux
-    from pymobiledevice3.lockdown import create_using_usbmux
-
-    failures = False
-    rows = []
-    with sigint_stop_event() as stop:
-        devices = await stage_wait(usbmux.list_devices(), args.timeout, "usbmux_list", stop)
-        for device in devices:
-            info = {"udid": device.serial, "connection": device.connection_type,
-                    "name": "unknown", "model": "unknown", "ios": "unknown", "state": "unknown"}
-            lockdown = None
-            try:
-                lockdown = await stage_wait(create_using_usbmux(serial=device.serial, autopair=False,
-                                                               connection_type=device.connection_type),
-                                            args.timeout, "device_information", stop)
-                values = getattr(lockdown, "all_values", {})
-                info.update(name=values.get("DeviceName", "unknown"), model=lockdown.product_type,
-                            ios=lockdown.product_version, state="paired" if lockdown.paired else "unpaired")
-            except CaptureStopped:
-                raise
-            except Exception as exc:
-                failures = True
-                info["state"] = "信息不可读 / information unavailable"
-                print_error(exc)
-            finally:
-                if lockdown is not None:
-                    try:
-                        await stage_wait(lockdown.close(), min(args.timeout, 5), "device_information_close")
-                    except Exception as exc:
-                        failures = True
-                        print_error(exc)
-            rows.append(info)
-    output = csv.writer(sys.stdout, lineterminator="\n")
-    output.writerow(["名称 / Name", "型号 / Model", "iOS", "连接 / Connection", "UDID", "配对 / Pairing"])
-    for row in rows:
-        output.writerow([row[k] for k in ("name", "model", "ios", "connection", "udid", "state")])
-    if not rows:
-        print_error(ValueError("no_device_connected"))
-    else:
-        print_status(f"发现 / found {len(rows)} 条连接；采集用 --udid 选择，兼容状态以 doctor/counters 为准。")
-    return RunResult(None, "failed" if not rows else "partial" if failures else "completed", {"devices": rows})
-
-
-def metadata_definitions(body):
+def read_counter_definitions(body):
     """只读取名称与说明，不执行或输出设备公式。 / Read names/descriptions without running or printing formulas."""
     definitions = body.get("0", body.get(0)) if isinstance(body, dict) else body
     if not isinstance(definitions, list) or any(not isinstance(c, list) or not c for c in definitions):
         raise ValueError("invalid_counter_metadata")
     counters = [CounterDefinition(c[0], description=c[2] if len(c) > 2 and isinstance(c[2], str) else "") for c in definitions]
-    counter_names(counters)
+    validate_counter_definitions(counters)
     return counters
 
 
-async def inspection_command(args):
-    """doctor 不启动采样；counters 只等待元数据并可靠停止。
-    Doctor never starts sampling; counters waits only for metadata and always attempts stop.
+# 8. 设备会话：连接、初始化与资源释放 / Device session: connection, initialization and resource cleanup
+class DeviceSession:
+    """拥有设备连接和 GPU 通道；open 初始化，close 释放所有已注册资源。
+    Own the device connection and GPU channel; open initializes and close releases registered resources.
     """
-    checks = []
+    def __init__(self, options):
+        """只创建本会话的资源容器，不连接设备；open 获取的资源都由 close 统一释放。
+        Create resource ownership without connecting; close releases all resources acquired by open.
+        """
+        self.options = options
+        self.resources = contextlib.AsyncExitStack()
+        self.service_provider = None
+        self.dvt_provider = None
+        self.gpu_service = None
+        self.timebase_info = None
+        self.device_summary = None
+        self.report_callback = None
 
-    def report(name, status, detail):
-        checks.append({"check": name, "status": status, "detail": str(detail)})
-        if args.command == "doctor":
-            print(f"[{status.upper()}] {name}: {detail}", flush=True)
+    async def open(self, stop_event, configure=True, report=None, debug=None):
+        """初始化 GPU 通道及时间基准并返回 self；成功后可读 gpu_service/timebase_info/device_summary。configure=False 只探测；report 接收检查结果，debug 记录原始回复。失败也需调用 close。
+        Initialize GPU/timebase and return self, exposing gpu_service/timebase_info/device_summary.
+        configure=False probes only; report receives checks and debug records replies. Call close
+        even after failure.
+        """
+        self.report_callback = report
+        require_transport_dependency()
+        from pymobiledevice3.services.dvt.instruments.dvt_provider import DvtProvider
+        from pymobiledevice3.services.dvt.instruments.device_info import DeviceInfo
+        from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
 
-    for check in local_checks():
-        report(*check)
-    if any(c["status"] == "failed" for c in checks):
-        if any(c["check"] == "Python" and c["status"] == "failed" for c in checks):
-            print_error(ValueError("unsupported_python"))
+        provider = await wait_for_stage(self.connect_provider(), self.options.connect_timeout, "connect", stop_event)
+        model = getattr(provider, "product_type", None)
+        self.report_check("设备连接与信任 / connection", f"{model or 'unknown'} / iOS {provider.product_version}")
+        self.dvt_provider = dvt = DvtProvider(provider)
+        self.resources.push_async_callback(self.close_gpu_channel)
+        await wait_for_stage(dvt.connect(), self.options.timeout, "dvt_connect", stop_event)
+        self.report_check("开发者服务 / developer service", "DVT connected")
+        service = await wait_for_stage(dvt.dtx.open_channel(GpuCounterService), self.options.timeout, "gpu_channel", stop_event)
+        service.debug = debug
+        info = await wait_for_stage(service.device_info(), self.options.timeout, "gpu_info", stop_event)
+        if debug is not None:
+            debug.record("rpc.device_info", info)
+        candidates = info if isinstance(info, list) else [info]
+        if not candidates or any(not isinstance(c, dict) for c in candidates):
+            raise ValueError("invalid_gpu_device_info")
+        if len(candidates) != 1:
+            raise ValueError("multiple_gpu_candidates: " + ", ".join(str(c.get("accelerator-id")) for c in candidates))
+        gpu = candidates[0]
+        profiles = gpu.get("supported-counter-profiles")
+        if profiles is not None and self.options.counter_profile not in profiles:
+            raise ValueError(f"unsupported_counter_profile: requested={self.options.counter_profile}, supported={profiles}")
+        self.report_check("GPU 能力 / GPU capability", f"{gpu.get('device-name', 'unknown')}, profiles={profiles or 'unknown'}")
+        device_info = await wait_for_stage(self.resources.enter_async_context(DeviceInfo(dvt)), self.options.timeout, "timebase_channel", stop_event)
+        mach = await wait_for_stage(device_info.mach_time_info(), self.options.timeout, "mach_timebase", stop_event)
+        if debug is not None:
+            debug.record("rpc.mach_time_info", mach)
+        if len(mach) < 3 or int(mach[1]) <= 0 or int(mach[2]) <= 0:
+            raise ValueError("invalid_mach_timebase")
+        self.report_check("设备时间基准 / timebase", f"{mach[1]}/{mach[2]}")
+        if configure:
+            reply = await wait_for_stage(service.configure(PInt64(gpu["accelerator-id"]), PInt64(self.options.counter_profile),
+                                                       PInt64(self.options.sampling_interval), PInt64(self.options.window_limit), PInt32(-1)),
+                                     self.options.timeout, "configure", stop_event)
+            if debug is not None:
+                debug.record("rpc.configure", reply)
+            if isinstance(reply, NSError) or reply is False:
+                raise ValueError("gpu_configuration_rejected")
+        # 仅标注既有验收范围，不选择公式、不修正数值，也不拒绝其他设备。
+        # Label prior acceptance scope only; never select formulas, correct values or reject other devices here.
+        verified = (model == "iPhone14,2" and provider.product_version == "18.5" and gpu.get("device-name") == "A15"
+                    and self.options.counter_profile == 3 and self.options.sampling_interval == 0 and self.options.window_limit == -1)
+        device = {"model": model, "ios_version": provider.product_version, "gpu_name": gpu.get("device-name"),
+                  "compatibility": "validated_baseline" if verified else "unverified"}
+        self.report_check("兼容范围 / compatibility", "已验证基线 / validated baseline" if verified else "未验证 / unverified")
+        if isinstance(provider, RemoteServiceDiscoveryService) and provider.lockdown is not None:
+            # GPU 已有独立 DTX 通道，后续服务端口来自缓存的 RSD 信息，不再使用远程 lockdown 查询。
+            # GPU owns a separate DTX channel; cached RSD discovery suffices without further remote lockdown queries.
+            # 在初始化结束时调用库的幂等 close，避免把闲置连接保留至长采集结束后才关闭。
+            # Use the library's idempotent close at initialization instead of retaining an idle connection until teardown.
+            await wait_for_stage(provider.lockdown.close(), self.options.timeout, "initial_remote_lockdown_close", stop_event)
+        self.gpu_service = service
+        self.timebase_info = mach
+        self.device_summary = device
+        return self
+
+    async def connect_provider(self):
+        """建立库的服务入口，并把连接资源登记到本会话。
+        Connect the library service provider and register its resources with this session.
+        """
+        require_transport_dependency()
+        from pymobiledevice3.lockdown import create_using_usbmux
+        from pymobiledevice3.remote.rsd_tunnel import PreferredRsdTunnel
+        from pymobiledevice3 import usbmux
+
+        # 显式 UDID 优先；没有选择时只接受唯一 USB 设备。 / Prefer an explicit UDID; otherwise require exactly one USB device.
+        serial = self.options.udid
+        if not serial:
+            devices = await usbmux.select_devices_by_connection_type(connection_type="USB")
+            if len(devices) != 1:
+                raise ValueError("no_device_connected" if not devices else
+                                 "multiple_devices: " + ", ".join(d.serial for d in devices))
+            serial = devices[0].serial
+        kwargs = {"serial": serial}
+        if getattr(self.options, "command", None) == "doctor":
+            kwargs["autopair"] = False
+        lockdown = await self.resources.enter_async_context(await create_using_usbmux(**kwargs))
+        if getattr(lockdown, "paired", True) is False:
+            raise ValueError("trust_required")
+
+        # 版本决定传输入口，协议细节交给库；这不是指标数值特判。
+        # OS version selects the transport; the library owns protocol details, not metric corrections.
+        if int(lockdown.product_version.split(".")[0]) >= 17:
+            provider = await self.resources.enter_async_context(PreferredRsdTunnel(serial=serial))
         else:
-            print_error(ImportError("本机 Python/依赖检查失败 / local runtime check failed"))
-        return RunResult(None, "failed", {"checks": checks})
-    stack = contextlib.AsyncExitStack()
-    service = None
-    attempted_start = False
-    counters = None
-    device = None
-    interrupted = False
-    with sigint_stop_event() as stop:
+            provider = lockdown
+        if self.options.udid and provider.udid != self.options.udid:
+            raise ValueError("selected_device_mismatch")
+        self.service_provider = provider
+        return provider
+
+    async def close(self):
+        """按资源登记的逆序关闭，支持重复调用；不在此发送 GPU stop 或取尾，这由采集会话协调。
+        Close registered resources in reverse order, allowing repeated calls; the capture session
+        coordinates GPU stop and tail retrieval separately.
+        """
+        await self.resources.aclose()
+
+    async def close_gpu_channel(self):
+        """先暂停读取，再关闭 DTX，避免迟到数据进入已结束的流。
+        Pause reads before closing DTX so late data cannot enter an ended stream.
+        """
         try:
-            service, _, device = await prepare_gpu(args, stack, stop, configure=args.command == "counters", report=report)
-            if args.command == "counters":
-                attempted_start = True
-                reply = await stage_wait(service.start(), args.timeout, "counter_metadata_start", stop)
-                if isinstance(reply, NSError) or reply is False:
-                    raise ValueError("gpu_counter_start_rejected")
-                deadline = asyncio.get_running_loop().time() + args.timeout
-                while counters is None:
-                    if service.closed.is_set():
-                        raise ConnectionError(service.failure or "gpu_connection_closed")
-                    payload = await stage_wait(service.events.get(), deadline - asyncio.get_running_loop().time(), "counter_metadata", stop)
-                    if isinstance(payload, NSError):
-                        raise ValueError(f"device_error: {payload.domain}/{payload.code}")
-                    if isinstance(payload, list) and len(payload) >= 5 and payload[0] == 0:
-                        counters = metadata_definitions(payload[4])
-                    elif not (isinstance(payload, list) and len(payload) == 2 and payload[0] in (2, 3)):
-                        raise ValueError("unexpected_notification_before_metadata")
-        except CaptureStopped:
-            interrupted = True
-        except Exception as exc:
-            report(getattr(exc, "gpu_stage", "检查 / inspection"), "failed", str(exc))
-            print_error(exc)
+            connection = getattr(self.dvt_provider, "_dtx", None)
+            writer = getattr(connection, "_writer", None)
+            if writer is not None:
+                # _writer 来自锁定的 pymobiledevice3 版本；实际停止读取使用 asyncio 公共接口。
+                # _writer belongs to the pinned pymobiledevice3 version; pausing uses asyncio's public API.
+                writer.transport.pause_reading()
         finally:
-            if attempted_start:
+            await self.dvt_provider.close()
+
+    def report_check(self, stage, detail):
+        if self.report_callback is not None:
+            self.report_callback(stage, "ok", detail)
+
+
+# 9. 采集会话：显式拥有状态、工作进程和完整收尾 / Capture session: explicit state, worker ownership and complete shutdown
+class CaptureSession:
+    """拥有一次录制的设备、工作进程与状态；run 是唯一正式采集入口。
+    Own one recording's device, workers and state; run is the production capture entrypoint.
+    """
+    def __init__(self, options, drain_grace_seconds=2):
+        """保存单次录制配置与状态，不访问设备；drain_grace_seconds 是取尾阶段等待迟到通知的宽限秒数。
+        Store one recording's options/state without device access; drain_grace_seconds bounds
+        waiting for late notifications while draining.
+        """
+        self.options = options
+        self.device_session = DeviceSession(options)
+        self.gpu_service = None
+        self.processing_worker = None
+        self.debug_recorder = None
+        self.stop_event = None
+        self.on_started = getattr(options, "on_started", None)
+        self.drain_grace_seconds = drain_grace_seconds
+        self.status_reporter = CaptureStatusReporter()
+        # 以下为单次录制状态，不跨 run 复用；连接和子进程在 initialize 时才创建。
+        # The following state belongs to one recording, not repeated runs; initialize creates connections/workers.
+        self.stop_reason = "user_stop"
+        self.errors = []
+        self.lifecycle = []
+        self.can_process_samples = True
+        self.remaining_batch_chunks = None
+        self.shutdown_deadline = None
+
+    async def run(self):
+        """初始化成功后进入采集；任何初始化失败仍释放本会话已获得的资源。
+        Enter collection after initialization; release acquired resources on any initialization failure.
+        """
+        check_output_path(self.options.output, self.options.format)
+        with capture_stop_signal() as self.stop_event:
+            try:
+                await self.initialize()
+            except BaseException:
+                await self.close_initialization_resources()
+                raise
+            return await self.collect_until_stopped()
+
+    async def initialize(self):
+        """先启用可选原始记录，再连接设备并启动解析进程。
+        Start optional raw recording, then connect the device and launch the parsing worker.
+        """
+        options = self.options
+        if getattr(options, "debug", False):
+            directory = getattr(options, "debug_directory", None) or (
+                Path("captures") / datetime.now().strftime("%Y%m%d_%H%M%S_%f") / "debug")
+            self.debug_recorder = DebugRecorder(directory, options.output)
+            await wait_for_stage(self.debug_recorder.start(options.timeout), options.timeout, "debug_start", self.stop_event)
+            print_status(f"Debug 原始数据 / Raw debug data: {self.debug_recorder.root.resolve()}")
+        print_status("正在连接设备 / Connecting to device")
+        await self.device_session.open(self.stop_event, debug=self.debug_recorder)
+        self.gpu_service = self.device_session.gpu_service
+        device = self.device_session.device_summary
+        print_status("兼容基线 / Compatibility: " + ("已验证设备 / verified device" if device["compatibility"] == "validated_baseline"
+                                                   else "未验证设备 / unverified device"))
+        mach = self.device_session.timebase_info
+        session_metadata = build_session_metadata(int(mach[1]), int(mach[2]), options.report_interval, device)
+        if self.debug_recorder is not None:
+            self.debug_recorder.record("session", session_metadata)
+        self.processing_worker = SampleProcessingWorker(options.output, session_metadata, options.format, options.console)
+        await wait_for_stage(self.processing_worker.receive(options.timeout), options.timeout, "worker_start", self.stop_event)
+
+    async def collect_until_stopped(self):
+        """仅用于已初始化的本次会话：启动采样、接收消息，用户停止或异常都进入 shutdown 并返回 CommandResult。run 负责正式初始化。
+        For an initialized session only: start and receive samples, then route user stop/errors
+        through shutdown to CommandResult. run owns production initialization.
+        """
+        self.loop = asyncio.get_running_loop()
+        self.capture_started_at = self.last_message_at = self.loop.time()
+        if self.stop_event is None:
+            self.stop_event = asyncio.Event()
+        try:
+            await self.start_sampling()
+            await self.receive_samples()
+        except CaptureStopped:
+            self.stop_reason = "user_stop"
+        except asyncio.CancelledError as exc:
+            self.stop_reason = "cancelled"
+            self.record_error("capture", exc)
+            self.can_process_samples = not self.processing_worker.broken
+        except Exception as exc:
+            self.stop_reason = "capture_error"
+            self.record_error("capture", exc)
+        finally:
+            return await self.shutdown()
+
+    async def start_sampling(self):
+        """启动回复确认后设置可选 on_started 事件；通知可能已经入队，回复不代表已收到有效样本。
+        Set optional on_started after the start reply; notifications may already be queued and the
+        reply does not prove valid samples arrived.
+        """
+        await self.call_gpu("start", self.gpu_service.start, can_stop=True)
+        if self.on_started:
+            self.on_started.set()
+        print_status("GPU Counter 已启动 / GPU started")
+
+    async def receive_samples(self):
+        """等待设备推送，不主动周期 flush；停止与连接关闭都在子批之间响应。
+        Wait for device pushes without periodic flush; respond to stop/disconnect between chunks.
+        """
+        while True:
+            now = self.loop.time()
+            if self.debug_recorder is not None:
+                self.debug_recorder.check()
+            if self.stop_event.is_set():
+                self.stop_reason = "user_stop"
+                break
+            if self.gpu_service.closed.is_set():
+                raise ConnectionError(self.gpu_service.failure or "connection_closed")
+            if not self.processing_worker.statistics["metadata_received"] and now - self.capture_started_at > self.options.timeout:
+                raise TimeoutError("metadata_timeout")
+            if not self.processing_worker.statistics["sample_count"] and now - self.capture_started_at > max(120, self.options.timeout):
+                raise TimeoutError("first_sample_timeout")
+            if self.gpu_service.events.empty() and now - self.last_message_at >= self.options.idle_timeout:
+                raise TimeoutError("notification_idle_timeout")
+            if self.gpu_service.events.empty():
+                self.status_reporter.wait()
+            try:
+                payload = await asyncio.wait_for(self.gpu_service.events.get(), .1)
+            except asyncio.TimeoutError:
+                continue
+            self.last_message_at = self.loop.time()
+            if not await self.process_message(payload, interruptible=True):
+                if self.gpu_service.closed.is_set() and not self.stop_event.is_set():
+                    raise ConnectionError(self.gpu_service.failure or "connection_closed")
+                break
+
+    async def process_message(self, payload, interruptible=False, announce=True):
+        """消息只提示一次；子批完成后才能中断，并保留余下子批。
+        Announce a message once; interrupt only after a chunk finishes and retain remaining chunks.
+        """
+        if not self.can_process_samples:
+            return
+        if (announce and isinstance(payload, list) and len(payload) >= 5 and payload[0] == 1
+                and type(payload[3]) is int and payload[3] > 0):
+            self.status_reporter.received(payload[3])
+        try:
+            chunks = iter(split_sample_batch(payload))
+            for chunk in chunks:
+                await self.processing_worker.call("process", chunk, timeout=self.remaining_timeout())
+                if interruptible and (self.stop_event.is_set() or self.gpu_service.closed.is_set()):
+                    # 当前子批确认后立即允许 stop；剩余早期记录必须先于后续通知和 flush 解码。
+                    # Allow stop after the current chunk; decode its remainder before later notifications and flush.
+                    self.remaining_batch_chunks = chunks
+                    return False
+            return True
+        except Exception:
+            self.can_process_samples = False
+            raise
+
+    async def shutdown(self):
+        """停止→早期数据排空→取尾→关闭连接→完成文件，失败阶段分别记录。
+        Stop, drain early data, fetch the tail, close connections and finalize, recording each failed stage.
+        """
+        self.collection_elapsed_seconds = self.loop.time() - self.capture_started_at
+        self.shutdown_started_at = self.loop.time()
+        self.shutdown_deadline = self.shutdown_started_at + self.options.shutdown_timeout
+        print_status("正在停止并保存尾部数据 / Stopping and draining GPU data")
+        try:
+            await self.call_gpu("stop", self.gpu_service.stop)
+        except Exception as exc:
+            self.record_error("stop", exc)
+        try:
+            if self.remaining_batch_chunks is not None and self.can_process_samples:
+                for chunk in self.remaining_batch_chunks:
+                    await self.process_message(chunk, announce=False)
+            await self.drain_received_messages(self.drain_grace_seconds)
+            # 只有早期消息全部解码后才能取尾；解析失效时保留已有结果并停止消费。
+            # Fetch the tail only after earlier messages; stop consuming after parsing becomes invalid.
+            if self.can_process_samples:
+                remaining = await self.call_gpu("flush", self.gpu_service.flush)
+                if isinstance(remaining, list) and (not remaining or isinstance(remaining[0], list)):
+                    for message in remaining:
+                        await self.process_message(message)
+                elif remaining is not None:
+                    await self.process_message(remaining)
+                await self.drain_received_messages(self.drain_grace_seconds)
+        except Exception as exc:
+            self.record_error("drain_or_flush", exc)
+        if self.gpu_service.failure:
+            self.record_error("service", ConnectionError(self.gpu_service.failure))
+        try:
+            await wait_for_stage(self.close_device_resources(), self.remaining_timeout(), "connection_close")
+        except Exception as exc:
+            self.record_error("connection_close", exc)
+        return await self.finalize_output()
+
+    async def drain_received_messages(self, grace):
+        """消费已接收通知，并在截止时间内短暂等待迟到消息。
+        Consume received notifications and briefly wait for late messages within the deadline.
+        """
+        until = min(self.shutdown_deadline, self.loop.time() + grace)
+        while self.can_process_samples and (not self.gpu_service.events.empty() or (self.loop.time() < until and not self.gpu_service.closed.is_set())):
+            if self.loop.time() >= self.shutdown_deadline:
+                raise TimeoutError("drain_budget_exhausted")
+            try:
+                payload = await asyncio.wait_for(self.gpu_service.events.get(), min(.1, max(.001, until - self.loop.time())))
+            except asyncio.TimeoutError:
+                continue
+            await self.process_message(payload)
+
+    async def finalize_output(self):
+        """完成解析文件；失败时保留已存在结果并保证解析进程退出。
+        Finalize parsed output; preserve existing results on failure and always close the parsing worker.
+        """
+        stats = dict(self.processing_worker.statistics)
+        if self.collection_elapsed_seconds >= 5 and stats["sample_span_s"] < self.collection_elapsed_seconds - 2:
+            self.record_error("coverage", ValueError(f"samples={stats['sample_span_s']:.3f}s, collection={self.collection_elapsed_seconds:.3f}s"))
+        details = {"stop_reason": self.stop_reason, "collection_elapsed_s": self.collection_elapsed_seconds, **stats,
+                   "errors": self.errors, "lifecycle": self.lifecycle}
+        if isinstance(self.gpu_service.events, GpuMessageQueue):
+            details["receive_queue"] = {"peak_messages": self.gpu_service.events.peak_messages,
+                                        "peak_payload_bytes": self.gpu_service.events.peak_bytes,
+                                        "max_messages": self.gpu_service.events.maxsize,
+                                        "max_payload_bytes": self.gpu_service.events.max_bytes}
+        result = None
+        try:
+            if self.processing_worker.broken or self.loop.time() >= self.shutdown_deadline:
+                raise TimeoutError("finalization_budget_exhausted_or_worker_unavailable")
+            saved = await self.processing_worker.call("finish", self.stop_reason, bool(self.errors), details, timeout=self.remaining_timeout())
+            details.update(self.processing_worker.statistics)
+            result = CommandResult(Path(saved["path"]), saved["status"], details)
+        except Exception as exc:
+            self.record_error("finalize", exc)
+        finally:
+            try:
+                await self.processing_worker.close()
+            except Exception as exc:
+                self.record_error("worker_close", exc)
+        if result is None:
+            path = Path(self.options.output) if Path(self.options.output).exists() else Path(str(self.options.output) + ".part")
+            result = CommandResult(path if path.exists() else None, "partial" if stats["has_values"] else "failed", details)
+        details["shutdown_elapsed_s"] = self.loop.time() - self.shutdown_started_at
+        if self.errors and result.status == "completed":
+            result.status = "partial"
+        if details.get("console_error"):
+            print_status("终端输出已关闭 / Console disabled: " + details["console_error"])
+        for error in self.errors:
+            print_status("采集异常 / Capture error: " + error)
+        if self.errors:
+            print_status("下一步 / Next: " + error_guidance(RuntimeError(self.errors[0])))
+        return result
+
+    async def close_device_resources(self):
+        """先关闭设备通道，再关闭原始记录；前者失败也必须尝试后者。
+        Close device channels before raw recording, attempting both even if the first fails.
+        """
+        try:
+            await self.device_session.close()
+        finally:
+            if self.debug_recorder is not None:
+                await self.debug_recorder.close()
+
+    async def close_initialization_resources(self):
+        """清理未完成初始化的会话，不掩盖原始初始化异常。
+        Clean up incomplete initialization without masking its original error.
+        """
+        try:
+            if self.processing_worker is not None:
+                await self.processing_worker.close()
+        except Exception as error:
+            print_status(f"工作进程清理失败 / Worker cleanup failed: {error}")
+        try:
+            await wait_for_stage(self.close_device_resources(), min(self.options.timeout, 5), "initialization_cleanup")
+        except Exception as error:
+            print_status(f"初始化清理失败 / Initialization cleanup failed: {error}")
+
+    async def call_gpu(self, name, operation, can_stop=False):
+        """在当前阶段预算内调用 GPU 方法，记录 RPC 回复和生命周期；can_stop 仅允许用户停止中断等待。
+        Call a GPU method within the current budget, recording its reply/lifecycle; can_stop allows
+        user stop to interrupt the wait.
+        """
+        try:
+            reply = await wait_for_stage(operation(), self.remaining_timeout(), name, self.stop_event if can_stop else None)
+            if self.debug_recorder is not None:
+                self.debug_recorder.record("rpc." + name, reply)
+            if isinstance(reply, NSError):
+                raise ValueError(f"device_error: {reply.domain}/{reply.code}")
+            self.lifecycle.append({"stage": name, "status": "ok", "samples_processed": self.processing_worker.statistics["sample_count"]})
+            return reply
+        except BaseException:
+            self.lifecycle.append({"stage": name, "status": "error", "samples_processed": self.processing_worker.statistics["sample_count"]})
+            raise
+
+    def remaining_timeout(self):
+        """收尾阶段的每个操作共用截止时间，不为每一步重新计时。
+        Every shutdown operation shares one deadline instead of resetting its budget.
+        """
+        return max(0, min(self.options.timeout, self.shutdown_deadline - self.loop.time())) if self.shutdown_deadline else self.options.timeout
+
+    def record_error(self, stage, error):
+        """有界保留失败阶段用于最终状态与提示，最多16条、每条512字符，不在此抛出。
+        Retain bounded stage errors for final status/messages, at most 16 entries of 512 characters,
+        without raising here.
+        """
+        if len(self.errors) < 16:
+            self.errors.append(f"{stage}: {type(error).__name__}: {error}"[:512])
+
+
+# 10. 应用入口：命令分发、检查和事件循环 / Application entrypoint: command dispatch, inspection and event loop
+class GpuCounterApp:
+    """用户命令的统一入口，负责调度与退出码，不直接拥有采集连接。
+    Unified user-command entrypoint for dispatch and exit codes, without owning capture connections.
+    """
+    def __init__(self, options=None):
+        """保存命令配置，不产生设备或进程副作用；options 可供内部检查调用，CLI run 会解析实际参数。
+        Store command options without device/process side effects; options supports internal
+        inspection calls while CLI run parses actual arguments.
+        """
+        self.options = options
+        self.inspection_checks = []
+
+    def run(self):
+        """解析命令行并返回退出码，业务资源由对应会话对象管理。
+        Parse CLI options and return an exit code; session objects own business resources.
+        """
+        for stream in (sys.stdout, sys.stderr):
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8")
+        parser = self.create_argument_parser()
+        self.options = args = parser.parse_args()
+        if args.command == "capture":
+            run_directory = Path("captures") / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            if args.output is None:
+                args.output = run_directory / ("gpu." + args.format)
+            if args.debug:
+                args.debug_directory = run_directory / "debug"
+            if args.output.suffix.lower() != "." + args.format:
+                parser.error("后缀须匹配 --format；JSON 请加 --format json / output suffix must match format")
+        try:
+            if args.command == "devices":
+                result = self.run_async_command(self.list_devices())
+            elif args.command in ("doctor", "counters"):
+                result = self.run_async_command(self.inspect_device())
+            else:
+                result = self.run_async_command(CaptureSession(args).run())
+                print_status(f"已保存 / Saved: {result.path.resolve() if result.path else '无结果文件 / no result file'} (status={result.status})")
+                if result.details:
+                    print_status(f"已解析样本 / samples={result.details.get('sample_count', 0)}，"
+                          f"窗口 / rows={result.details.get('row_count', 0)}，"
+                          f"设备跨度 / span={result.details.get('sample_span_s', 0):.3f}s")
+                if result.path and result.path.suffix == ".part":
+                    print_status("保留了中断结果；使用 tools/recover_results.py 恢复到新路径 / Recover the .part file to a new path.")
+            return 0 if result.status == "completed" else 1
+        except (KeyboardInterrupt, CaptureStopped):
+            print_status("操作已中断 / Operation interrupted")
+            return 130
+        except Exception as exc:
+            print_error(exc)
+            return 1
+
+    @staticmethod
+    def create_argument_parser():
+        """定义公开命令及内部固定策略，只构建解析器；不会连接设备、创建输出或启动采集。
+        Define public commands and fixed internal policy by building a parser only; do not connect,
+        create output or start sampling.
+        """
+        parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False,
+                                         epilog="建议流程 / Workflow: devices → doctor → counters → capture；Ctrl+C 停止录制")
+        # 内部固定策略不是命令行选项；不向操作者暴露协议参数或定时录制。
+        # Fixed runtime policy is not a CLI option; operators do not configure protocol details or timed capture.
+        parser.set_defaults(timeout=10, connect_timeout=30, shutdown_timeout=25, idle_timeout=30,
+                            report_interval=1, counter_profile=3, sampling_interval=0, window_limit=-1)
+        sub = parser.add_subparsers(dest="command", required=True, title="命令 / Commands")
+        capture = sub.add_parser("capture", allow_abbrev=False,
+                                 help="持续采集，Ctrl+C 结束并保存 / capture until Ctrl+C")
+        doctor = sub.add_parser("doctor", allow_abbrev=False,
+                                help="检查环境与设备服务 / check prerequisites")
+        counters = sub.add_parser("counters", allow_abbrev=False,
+                                  help="查看设备提供的指标 / list available counters")
+        devices = sub.add_parser("devices", allow_abbrev=False,
+                                 help="查看连接的设备 / list connected devices")
+        for command in (capture, doctor, counters):
+            command.add_argument("--udid", help="多设备时选择 UDID；单设备自动选择 / select a device when several are connected")
+        capture.add_argument("--output", type=Path, help="保存路径；默认自动创建，不覆盖旧文件 / output path")
+        capture.add_argument("--format", choices=("csv", "json"), default="csv", help="文件格式，默认 CSV / output format")
+        capture.add_argument("--console", choices=("key", "all", "none"), default="key",
+                             help="终端显示重点/全部/不显示数据；文件始终全量 / terminal counter selection")
+        capture.add_argument("--debug", action="store_true",
+                             help="额外在 captures 保存原始元数据、JS 和采样字节 / save raw GPU data under captures")
+        for command in (parser, capture, doctor, counters, devices):
+            command._positionals.title = "位置参数 / Arguments"
+            command._optionals.title = "选项 / Options"
+        return parser
+
+    @staticmethod
+    def run_async_command(awaitable):
+        """运行单个命令并有界取消后台任务，避免事件循环退出无限等待。
+        Run one command and bound background cancellation so event-loop shutdown cannot wait forever.
+        """
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result = None
+        try:
+            result = loop.run_until_complete(awaitable)
+            return result
+        finally:
+            try:
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    _, remaining = loop.run_until_complete(asyncio.wait(pending, timeout=1))
+                    if remaining:
+                        print_status("后台任务取消超时 / Background cancellation timed out")
+                        if result is not None:
+                            result.details.setdefault("errors", []).append("background_cancellation_timeout")
+                            if result.status == "completed":
+                                result.status = "partial"
+            finally:
+                loop.close()
+                asyncio.set_event_loop(None)
+
+    async def list_devices(self):
+        """枚举连接；某台信息不可读时仍展示其标识，且不触发新配对。
+        Enumerate connections, retaining identifiers on lookup failure without initiating pairing.
+        """
+        require_transport_dependency()
+        from pymobiledevice3 import usbmux
+        from pymobiledevice3.lockdown import create_using_usbmux
+
+        failures = False
+        rows = []
+        with capture_stop_signal() as stop:
+            devices = await wait_for_stage(usbmux.list_devices(), self.options.timeout, "usbmux_list", stop)
+            for device in devices:
+                info = {"udid": device.serial, "connection": device.connection_type,
+                        "name": "unknown", "model": "unknown", "ios": "unknown", "state": "unknown"}
+                lockdown = None
                 try:
-                    reply = await stage_wait(service.stop(), args.timeout, "counter_metadata_stop")
-                    if isinstance(reply, NSError) or reply is False:
-                        raise ValueError("gpu_counter_stop_rejected")
-                    # stop 回复不是异步通知成功的保证；检查短宽限期内的错误，样本仅丢弃。
-                    # A stop reply does not confirm asynchronous success; check grace-period errors and discard samples.
-                    until = asyncio.get_running_loop().time() + min(.2, args.timeout)
-                    while asyncio.get_running_loop().time() < until:
+                    lockdown = await wait_for_stage(create_using_usbmux(serial=device.serial, autopair=False,
+                                                                   connection_type=device.connection_type),
+                                                self.options.timeout, "device_information", stop)
+                    values = getattr(lockdown, "all_values", {})
+                    info.update(name=values.get("DeviceName", "unknown"), model=lockdown.product_type,
+                                ios=lockdown.product_version, state="paired" if lockdown.paired else "unpaired")
+                except CaptureStopped:
+                    raise
+                except Exception as exc:
+                    failures = True
+                    info["state"] = "信息不可读 / information unavailable"
+                    print_error(exc)
+                finally:
+                    if lockdown is not None:
                         try:
-                            payload = await asyncio.wait_for(service.events.get(), max(.001, until - asyncio.get_running_loop().time()))
-                        except asyncio.TimeoutError:
-                            break
+                            await wait_for_stage(lockdown.close(), min(self.options.timeout, 5), "device_information_close")
+                        except Exception as exc:
+                            failures = True
+                            print_error(exc)
+                rows.append(info)
+        output = csv.writer(sys.stdout, lineterminator="\n")
+        output.writerow(["名称 / Name", "型号 / Model", "iOS", "连接 / Connection", "UDID", "配对 / Pairing"])
+        for row in rows:
+            output.writerow([row[k] for k in ("name", "model", "ios", "connection", "udid", "state")])
+        if not rows:
+            print_error(ValueError("no_device_connected"))
+        else:
+            print_status(f"发现 / found {len(rows)} 条连接；采集用 --udid 选择，兼容状态以 doctor/counters 为准。")
+        return CommandResult(None, "failed" if not rows else "partial" if failures else "completed", {"devices": rows})
+
+    async def inspect_device(self):
+        """doctor 检查服务，counters 只读取元数据；两者共享设备会话并可靠关闭。
+        Doctor checks services and counters reads metadata only; both share device-session cleanup.
+        """
+        self.inspection_checks = []
+        for check in check_runtime_requirements():
+            self.report_inspection(*check)
+        if any(c["status"] == "failed" for c in self.inspection_checks):
+            if any(c["check"] == "Python" and c["status"] == "failed" for c in self.inspection_checks):
+                print_error(ValueError("unsupported_python"))
+            else:
+                print_error(ImportError("本机 Python/依赖检查失败 / local runtime check failed"))
+            return CommandResult(None, "failed", {"checks": self.inspection_checks})
+        device_session = DeviceSession(self.options)
+        service = None
+        attempted_start = False
+        counters = None
+        device = None
+        interrupted = False
+        with capture_stop_signal() as stop:
+            try:
+                await device_session.open(stop, configure=self.options.command == "counters", report=self.report_inspection)
+                service = device_session.gpu_service
+                device = device_session.device_summary
+                if self.options.command == "counters":
+                    attempted_start = True
+                    reply = await wait_for_stage(service.start(), self.options.timeout, "counter_metadata_start", stop)
+                    if isinstance(reply, NSError) or reply is False:
+                        raise ValueError("gpu_counter_start_rejected")
+                    deadline = asyncio.get_running_loop().time() + self.options.timeout
+                    while counters is None:
+                        if service.closed.is_set():
+                            raise ConnectionError(service.failure or "gpu_connection_closed")
+                        payload = await wait_for_stage(service.events.get(), deadline - asyncio.get_running_loop().time(), "counter_metadata", stop)
                         if isinstance(payload, NSError):
                             raise ValueError(f"device_error: {payload.domain}/{payload.code}")
-                        if (counters is not None and isinstance(payload, list) and len(payload) >= 5 and payload[0] == 0
-                                and metadata_definitions(payload[4]) != counters):
-                            raise ValueError("metadata_changed")
-                    if service.failure:
-                        raise ConnectionError(service.failure)
-                except Exception as exc:
-                    report("停止 / stop", "failed", str(exc))
-                    print_error(exc)
-            try:
-                await stage_wait(stack.aclose(), min(args.timeout, 5), "inspection_close")
+                        if isinstance(payload, list) and len(payload) >= 5 and payload[0] == 0:
+                            counters = read_counter_definitions(payload[4])
+                        elif not (isinstance(payload, list) and len(payload) == 2 and payload[0] in (2, 3)):
+                            raise ValueError("unexpected_notification_before_metadata")
+            except CaptureStopped:
+                interrupted = True
             except Exception as exc:
-                report("关闭 / close", "failed", str(exc))
+                self.report_inspection(getattr(exc, "gpu_stage", "检查 / inspection"), "failed", str(exc))
                 print_error(exc)
-    if interrupted:
-        raise CaptureStopped("inspection_interrupted")
-    failed = any(c["status"] == "failed" for c in checks)
-    if counters is not None:
-        output = csv.writer(sys.stdout, lineterminator="\n")
-        output.writerow(["Counter", "单位 / Unit", "说明 / Description"])
-        for counter in counters:
-            output.writerow([counter.name, counter.unit or "unknown / 未证实", counter.description])
-        print_status(f"{len(counters)} 项指标；兼容 / compatibility={device['compatibility']}。只读取元数据，未保存样本。")
-    if args.command == "doctor" and not failed:
-        print_status("服务检查通过；未启动采样，不代表数据完整性或跨设备验收。下一步运行 counters 或 capture。")
-    return RunResult(None, "failed" if failed else "completed", {"checks": checks})
-
-
-async def live(args):
-    """先验证输出，再初始化设备/工作进程，最后把收尾责任交给采集循环。
-    Validate output, initialize device/workers, then transfer cleanup ownership to the collection loop.
-    """
-    format = getattr(args, "format", "csv")
-    preflight_result_path(args.output, format)
-    stack = contextlib.AsyncExitStack()
-    worker = debug = None
-    handed_off = False
-    with sigint_stop_event() as stop:
-        try:
-            if getattr(args, "debug", False):
-                root = getattr(args, "debug_directory", None) or (Path("captures") / datetime.now().strftime("%Y%m%d_%H%M%S_%f") / "debug")
-                debug = DebugRecorder(root, args.output)
-                stack.push_async_callback(debug.close)
-                await stage_wait(debug.start(args.timeout), args.timeout, "debug_start", stop)
-                print_status(f"Debug 原始数据 / Raw debug data: {debug.root.resolve()}")
-            print_status("正在连接设备 / Connecting to device")
-            service, mach, device = await prepare_gpu(args, stack, stop, debug=debug)
-            print_status("兼容基线 / Compatibility: " + ("已验证设备 / verified device" if device["compatibility"] == "validated_baseline"
-                                                 else "未验证设备 / unverified device"))
-            header = make_header(int(mach[1]), int(mach[2]), args.report_interval, device)
-            if debug is not None:
-                debug.record("session", header)
-            worker = CaptureWorker(args.output, header, format, args.console)
-            await stage_wait(worker.receive(args.timeout), args.timeout, "worker_start", stop)
-            # 交接前的失败由 finally 清理；交接后由 collect_parsed 负责所有收尾。
-            # finally handles pre-handoff failures; collect_parsed owns all cleanup after handoff.
-            handed_off = True
-            return await collect_parsed(service, worker, args.output, format, stop_event=stop, timeout=args.timeout,
-                                        idle_timeout=getattr(args, "idle_timeout", 30),
-                                        shutdown_timeout=getattr(args, "shutdown_timeout", 25),
-                                        cleanup=stack.aclose, on_started=getattr(args, "on_started", None))
-        finally:
-            if not handed_off:
-                if worker is not None:
-                    await worker.close()
+            finally:
+                if attempted_start:
+                    try:
+                        reply = await wait_for_stage(service.stop(), self.options.timeout, "counter_metadata_stop")
+                        if isinstance(reply, NSError) or reply is False:
+                            raise ValueError("gpu_counter_stop_rejected")
+                        # stop 回复不是异步通知成功的保证；检查短宽限期内的错误，样本仅丢弃。
+                        # A stop reply does not confirm asynchronous success; check grace-period errors and discard samples.
+                        until = asyncio.get_running_loop().time() + min(.2, self.options.timeout)
+                        while asyncio.get_running_loop().time() < until:
+                            try:
+                                payload = await asyncio.wait_for(service.events.get(), max(.001, until - asyncio.get_running_loop().time()))
+                            except asyncio.TimeoutError:
+                                break
+                            if isinstance(payload, NSError):
+                                raise ValueError(f"device_error: {payload.domain}/{payload.code}")
+                            if (counters is not None and isinstance(payload, list) and len(payload) >= 5 and payload[0] == 0
+                                    and read_counter_definitions(payload[4]) != counters):
+                                raise ValueError("metadata_changed")
+                        if service.failure:
+                            raise ConnectionError(service.failure)
+                    except Exception as exc:
+                        self.report_inspection("停止 / stop", "failed", str(exc))
+                        print_error(exc)
                 try:
-                    await stage_wait(stack.aclose(), min(args.timeout, 5), "initialization_cleanup")
+                    await wait_for_stage(device_session.close(), min(self.options.timeout, 5), "inspection_close")
                 except Exception as exc:
-                    print_status(f"初始化清理失败 / Initialization cleanup failed: {exc}")
+                    self.report_inspection("关闭 / close", "failed", str(exc))
+                    print_error(exc)
+        if interrupted:
+            raise CaptureStopped("inspection_interrupted")
+        failed = any(c["status"] == "failed" for c in self.inspection_checks)
+        if counters is not None:
+            output = csv.writer(sys.stdout, lineterminator="\n")
+            output.writerow(["Counter", "单位 / Unit", "说明 / Description"])
+            for counter in counters:
+                output.writerow([counter.name, counter.unit or " / ", counter.description])
+            print_status(f"{len(counters)} 项指标；兼容 / compatibility={device['compatibility']}。只读取元数据，未保存样本。")
+        if self.options.command == "doctor" and not failed:
+            print_status("服务检查通过；未启动采样，不代表数据完整性或跨设备验收。下一步运行 counters 或 capture。")
+        return CommandResult(None, "failed" if failed else "completed", {"checks": self.inspection_checks})
 
-
-def run_capture(awaitable):
-    """CLI 的有界事件循环收尾；避免 asyncio.run 无限等待拒绝取消的后台任务。
-    Bounded CLI loop cleanup avoids asyncio.run waiting forever on cancellation-resistant tasks.
-    """
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    result = None
-    try:
-        result = loop.run_until_complete(awaitable)
-        return result
-    finally:
-        try:
-            pending = asyncio.all_tasks(loop)
-            for task in pending:
-                task.cancel()
-            if pending:
-                _, remaining = loop.run_until_complete(asyncio.wait(pending, timeout=1))
-                if remaining:
-                    print_status("后台任务取消超时 / Background cancellation timed out")
-                    if result is not None:
-                        result.details.setdefault("errors", []).append("background_cancellation_timeout")
-                        if result.status == "completed":
-                            result.status = "partial"
-        finally:
-            loop.close()
-            asyncio.set_event_loop(None)
-
-
-def build_parser():
-    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False,
-                                     epilog="建议流程 / Workflow: devices → doctor → counters → capture；Ctrl+C 停止录制")
-    # 内部固定策略不是命令行选项；不向操作者暴露协议参数或定时录制。
-    # Fixed runtime policy is not a CLI option; operators do not configure protocol details or timed capture.
-    parser.set_defaults(timeout=10, connect_timeout=30, shutdown_timeout=25, idle_timeout=30,
-                        report_interval=1, counter_profile=3, sampling_interval=0, window_limit=-1)
-    sub = parser.add_subparsers(dest="command", required=True, title="命令 / Commands")
-    capture = sub.add_parser("capture", allow_abbrev=False,
-                             help="持续采集，Ctrl+C 结束并保存 / capture until Ctrl+C")
-    doctor = sub.add_parser("doctor", allow_abbrev=False,
-                            help="检查环境与设备服务 / check prerequisites")
-    counters = sub.add_parser("counters", allow_abbrev=False,
-                              help="查看设备提供的指标 / list available counters")
-    devices = sub.add_parser("devices", allow_abbrev=False,
-                             help="查看连接的设备 / list connected devices")
-    for command in (capture, doctor, counters):
-        command.add_argument("--udid", help="多设备时选择 UDID；单设备自动选择 / select a device when several are connected")
-    capture.add_argument("--output", type=Path, help="保存路径；默认自动创建，不覆盖旧文件 / output path")
-    capture.add_argument("--format", choices=("csv", "json"), default="csv", help="文件格式，默认 CSV / output format")
-    capture.add_argument("--console", choices=("key", "all", "none"), default="key",
-                         help="终端显示重点/全部/不显示数据；文件始终全量 / terminal counter selection")
-    capture.add_argument("--debug", action="store_true",
-                         help="额外在 captures 保存原始元数据、JS 和采样字节 / save raw GPU data under captures")
-    for command in (parser, capture, doctor, counters, devices):
-        command._positionals.title = "位置参数 / Arguments"
-        command._optionals.title = "选项 / Options"
-    return parser
+    def report_inspection(self, name, status, detail):
+        self.inspection_checks.append({"check": name, "status": status, "detail": str(detail)})
+        if self.options.command == "doctor":
+            print(f"[{status.upper()}] {name}: {detail}", flush=True)
 
 
 def main():
-    # 管道重定向也固定使用 UTF-8，确保 Windows 下双语帮助和日志能被一致读取。
-    # Use UTF-8 for redirected streams too, keeping bilingual help and logs consistent on Windows.
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8")
-    parser = build_parser()
-    args = parser.parse_args()
-    if args.command == "capture":
-        run_directory = Path("captures") / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        if args.output is None:
-            args.output = run_directory / ("gpu." + args.format)
-        if args.debug:
-            args.debug_directory = run_directory / "debug"
-        if args.output.suffix.lower() != "." + args.format:
-            parser.error("后缀须匹配 --format；JSON 请加 --format json / output suffix must match format")
-    try:
-        if args.command == "devices":
-            result = run_capture(devices_command(args))
-        elif args.command in ("doctor", "counters"):
-            result = run_capture(inspection_command(args))
-        else:
-            result = run_capture(live(args))
-            print_status(f"已保存 / Saved: {result.path.resolve() if result.path else '无结果文件 / no result file'} (status={result.status})")
-            if result.details:
-                print_status(f"已解析样本 / samples={result.details.get('sample_count', 0)}，"
-                      f"窗口 / rows={result.details.get('row_count', 0)}，"
-                      f"设备跨度 / span={result.details.get('sample_span_s', 0):.3f}s")
-            if result.path and result.path.suffix == ".part":
-                print_status("保留了中断结果；使用 tools/recover_results.py 恢复到新路径 / Recover the .part file to a new path.")
-        return 0 if result.status == "completed" else 1
-    except (KeyboardInterrupt, CaptureStopped):
-        print_status("操作已中断 / Operation interrupted")
-        return 130
-    except Exception as exc:
-        print_error(exc)
-        return 1
+    """保持脚本入口简单：应用对象执行命令并返回进程退出码。
+    Keep the script entrypoint small: the application executes the command and returns its exit
+    code.
+    """
+    return GpuCounterApp().run()
 
 
 if __name__ == "__main__":

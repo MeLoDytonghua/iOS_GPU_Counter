@@ -48,7 +48,7 @@ flowchart LR
 
 这些是协议职责，并不是每一层都启动一个独立进程。当前工具按 UDID 或唯一 USB 设备选择目标；再根据系统版本使用库的 lockdown 或 RSD 隧道路径。版本决定连接方式，不决定 Counter 公式。库支持某条路径也不等于本工具已经验证所有设备。
 
-`DvtProvider` 建立 DTX 连接后，通过 `open_channel(GpuService)` 打开 GPU 逻辑通道：
+`DvtProvider` 建立 DTX 连接后，通过 `open_channel(GpuCounterService)` 打开 GPU 逻辑通道：
 
 ```text
 com.apple.instruments.server.services.gpu
@@ -110,9 +110,9 @@ async def notification(self, payload):
 
 | 键 | 内容 | 代码中的去向 |
 |---|---|---|
-| `0` | 最终指标定义 | `Decoder.counters` |
-| `1` | 原始字段名称、顺序与处理标记 | `Decoder.raw_fields` |
-| `2` | JS 源码字符串 | `FormulaEngine` |
+| `0` | 最终指标定义 | `GpuSampleDecoder.counters` |
+| `1` | 原始字段名称、顺序与处理标记 | `GpuSampleDecoder.raw_fields` |
+| `2` | JS 源码字符串 | `DeviceFormulaEvaluator` |
 | `3` | GPU 参数 | JS 全局变量 |
 
 设备的字段名可能是难以阅读的长标识。它来自元数据，不由工具计算或反推；同一个标识连接了“元数据里的字段”“采样数组中的位置”和“JS 使用的变量”。
@@ -153,7 +153,7 @@ Python 解包后执行 `timestamp, *raw = row`。于是 `raw_fields[i]` 对应 `
 | 上一条 | T0 | 100 | 1000 | 12 |
 | 当前条 | T1 | 100 | 1040 | 20 |
 
-`Decoder._prepare_formula_inputs()` 得到：
+`GpuSampleDecoder._prepare_formula_inputs()` 得到：
 
 ```text
 GRC_GPU_CYCLES = 100          协议字段，直接取当前值
@@ -250,7 +250,7 @@ QuickJS 执行后返回 0.4；Python 根据设备定义执行：
 | 执行位置 | 负责什么 | 为什么这样分 |
 |---|---|---|
 | 主进程事件循环 | 设备连接、DTX 接收、停止与超时 | 等回复时仍能接收通知 |
-| 解析子进程单线程 | Decoder、QuickJS、窗口、结果文件及终端数据 | 保证 JS 线程约束，阻塞时可终止进程 |
+| 解析子进程单线程 | GpuSampleDecoder、QuickJS、窗口、结果文件及终端数据 | 保证 JS 线程约束，阻塞时可终止进程 |
 | 可选 Debug 子进程 | 元数据、JS、二进制与消息索引 | 原始文件写入不阻塞接收回调 |
 
 接收队列有消息数/字节预算；解析批次最多按 512 条拆成主机任务，每次只等一个请求完成。这是主机工作划分，不改变设备采样频率。原始 Debug 记录发生在拆分/解析之前。
@@ -405,24 +405,89 @@ LLC 活动高并不要求外部带宽也高，缓存可以吸收访问；反之�
 
 一秒均值适合观察持续变化，短尖峰可能被平均稀释；分析单帧异常时，应结合外部逐帧数据。
 
-## 9. 如何阅读源码
+## 9. 对象分工与源码阅读路线
 
-主文件 [ios_gpu_counter.py](../ios_gpu_counter.py) 按职责分区，入口在末尾。第一次阅读不必从 import 开始逐行读，建议沿以下路线：
+业务流程由三个对象组织，均位于单文件 [ios_gpu_counter.py](../ios_gpu_counter.py)。没有继承框架，也不需要先理解所有辅助函数。
 
-| 顺序 | 符号 | 先回答这个问题 |
-|---|---|---|
-| 1 | `main` / `build_parser` | 用户选了哪个命令，输出到哪里？ |
-| 2 | `live` | 什么时候创建连接/进程，失败后谁负责清理？ |
-| 3 | `connect_device` / `prepare_gpu` | 如何使用库找到并配置 GPU 服务？ |
-| 4 | `GpuService` / `collect_parsed` | 回复与通知如何进来，如何开始和结束？ |
-| 5 | `ParsedPipeline` | 哪条消息是元数据，哪条是样本？ |
-| 6 | `Decoder.metadata` / `Decoder.samples` | 字段如何绑定，二进制如何解包？ |
-| 7 | `_prepare_formula_inputs` / `_evaluate_counters` | 哪些值差分、如何生成 _norm、如何调用 JS？ |
-| 8 | `WindowAggregator` / `ResultWriter` / `WindowOutput` | 怎样按秒平均，怎样保证文件和终端一致？ |
-| 按需 | `CaptureWorker` / `stage_wait` / `run_capture` | 进程通信、超时与退出如何保证有界？ |
-| 按需 | `DebugRecorder` / `DebugArchive` | 原始数据在哪里被记录和写盘？ |
+```mermaid
+flowchart TD
+    A[GpuCounterApp: 命令与退出码] --> B[CaptureSession: 一次录制]
+    A --> C[DeviceSession: 设备检查]
+    B --> D[DeviceSession: 设备连接与GPU服务]
+    B --> E[SampleProcessingWorker: 解析进程]
+    B --> F[DebugRecorder: 可选原始记录]
+    E --> G[CaptureDataPipeline]
+    G --> H[GpuSampleDecoder / DeviceFormulaEvaluator]
+    G --> I[WindowAggregator / ResultWriter / CaptureOutput]
+```
 
-源码中标注的“已验证设备”只是既有验证范围，不选择数值公式，也不拦截其他设备。理解通用算法时不需要依赖该标签；真实适用范围见 [使用说明](USAGE.md#兼容性与已知限制)。
+箭头表示持有或调用关系，解析工作位于子进程。`CaptureOutput` 会先写结果文件，再显示同一份窗口数据。
+
+### 9.1 先读三个入口
+
+| 对象与方法 | 职责 |
+|---|---|
+| `GpuCounterApp.run()` | 解析命令、选择 devices/doctor/counters/capture、汇报结果和退出码 |
+| `DeviceSession.open()` / `close()` | 建立服务连接、获取 GPU 与时间信息，统一释放已登记资源 |
+| `CaptureSession.run()` | 创建一次录制所需资源；初始化失败也释放已有资源 |
+
+启动采集后，主要阅读顺序是：
+
+```text
+CaptureSession.run
+  → initialize                 创建 Debug、连接设备、启动解析进程
+  → collect_until_stopped      启动采样并处理停止/错误
+      → start_sampling
+      → receive_samples
+          → process_message
+      → shutdown               停止、排空、取尾、关闭设备及 Debug
+          → finalize_output    完成结果文件并关闭解析进程
+```
+
+`remaining_batch_chunks` 是尚未处理的早期子批，`can_process_samples` 表示解析还能否继续，`shutdown_deadline` 是整个收尾共用的截止时刻。它们属于同一次 `CaptureSession`，由实例属性明确保存，不通过闭包和 nonlocal 隐式共享。
+
+资源由创建它们的会话管理：`DeviceSession` 负责设备连接，`CaptureSession` 协调设备会话、解析进程和 Debug；应用入口只调度命令，不直接关闭底层连接。
+
+### 9.2 再读数据路径
+
+| 对象与方法 | 要回答的问题 |
+|---|---|
+| `GpuCounterService.notification()` | 设备通知如何进入接收队列？ |
+| `CaptureDataPipeline.process()` | 如何区分元数据与采样消息？ |
+| `GpuSampleDecoder.configure_metadata()` | 原始字段、指标定义、JS 如何绑定？ |
+| `GpuSampleDecoder.decode_samples()` | 字节如何解包，异常怎样跳过？ |
+| `_prepare_formula_inputs()` / `_evaluate_counters()` | 差分、_norm 与设备公式如何衔接？ |
+| `DeviceFormulaEvaluator.evaluate()` | 怎样向 QuickJS 注入变量并执行指标函数？ |
+| `WindowAggregator.add()` / `finish()` | 样本如何进入窗口，尾窗如何形成？ |
+| `ResultWriter.write()` / `CaptureOutput.emit()` | 文件和终端如何共享同一份值？ |
+
+### 9.3 最后按需读基础设施
+
+- `wait_for_stage()`：为异步操作设超时与停止预算。
+- `GpuCounterApp.run_async_command()`：运行事件循环，并有界取消后台任务。
+- `SampleProcessingWorker`：主进程与解析子进程交换请求和结果。
+- `DebugRecorder` / `DebugArchive`：有界原始记录队列与写盘实现。
+- `split_sample_batch()`：把设备大批次拆成有限大小的主机处理任务。
+
+无状态转换函数和两个模块级子进程入口仍保留函数形式。子进程在自己的进程内创建 QuickJS 和文件对象，不把活动的连接或 JS 上下文传给它。统一的是业务职责与资源所有权，而不是把每个函数都包装成类。
+
+### 9.4 读注释时注意调用边界
+
+关键方法的中英双语说明会交代输入、状态变化和失败行为。容易混淆的几个边界如下：
+
+| 方法 | 调用前与调用后 |
+|---|---|
+| `DeviceSession.open()` | 对象构造不连接设备；open 成功后才有 GPU 服务、时间信息和设备摘要，失败后也需 close |
+| `CaptureSession.run()` | 正式录制入口，负责初始化和失败清理；内部 collect_until_stopped 只接收已初始化的会话 |
+| `GpuSampleDecoder.configure_metadata()` | 配置字段与 JS 并重置前值，返回 None；它不保存原始归档 |
+| `GpuSampleDecoder.decode_samples()` | 返回逐条生成的样本；数值异常体现在 status/errors，布局损坏则抛出异常 |
+| `SampleProcessingWorker.call()` | 发送一项工作并等待回复；同一个解析进程不并发接收多个在途请求 |
+| `ResultWriter.finish()` / `close()` | finish 写最终状态并完成文件；close 只释放句柄，不能当成“保存完成” |
+| `DebugRecorder.start()` / `close()` | start 等待写入进程就绪，close 核对记录数并收尾；调试记录 closed 与采集 completed 是两种状态 |
+
+停止阶段的 RPC、排空和文件完成共用一个收尾截止时间。单步超时不应重置整个预算，也不应省略后续资源释放。阅读实现时，先沿 run 看主流程，再根据表中边界进入具体方法。
+
+具体参数与输出字段仍以命令帮助和 [输出格式](OUTPUT_FORMAT.md) 为准，内部命名变化不改变 CLI 或文件契约。
 
 ## 10. 继续阅读
 
