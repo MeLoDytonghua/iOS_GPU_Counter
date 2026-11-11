@@ -76,7 +76,7 @@ await service.device_info()
   → Python 得到 list/dict 等对象
 ```
 
-初始化依次执行：选设备 → 连接 DVT → 打开 GPU 通道 → `requestDeviceGPUInfo` → 查询 Mach 时间基准 → 配置 Counter。时间基准来自 DeviceInfo 初始化查询，不会同时启动 Graphics、Sysmontap 等性能采样器。
+初始化依次执行：选设备 → 连接 DVT → 打开 GPU 通道 → `requestDeviceGPUInfo` → 查询 Mach 时间基准 → 配置 Counter。DeviceInfo 只负责初始化时间查询，持续采样由 GPU Counter 服务完成。
 
 ### 2.3 请求回复与采样通知是两条逻辑路径
 
@@ -367,7 +367,7 @@ LLC 活动高并不要求外部带宽也高，缓存可以吸收访问；反之�
 | `Compute Occupancy` | 计算 Shader 并发 SIMD 组相对最大容量 | 粒子、剔除、图像计算等并发活动；需要具体 dispatch 才能确认低并发原因 |
 | `Partial Renders Count` | 设备定义的 encoder 内部分渲染次数，导出为有效样本均值 | 持续非零或随功能变化时，进一步查看对应渲染 Pass；仅凭已有设备定义短描述不能确定触发原因，更不能等同于掉帧、Pass 数或内存溢出次数 |
 
-本工具没有 `TotalOccupancy` 列，也不会从这三个值构造 GPU Usage。关于并发量、寄存器及线程组资源的进一步定位，参见 [GPU occupancy](https://developer.apple.com/documentation/xcode/finding-your-metal-apps-gpu-occupancy)。
+三个 Occupancy 分别描述对应阶段的并发占用程度，应结合各自的工作负载解读。进一步说明见 [GPU occupancy](https://developer.apple.com/documentation/xcode/finding-your-metal-apps-gpu-occupancy)。
 
 ## 7. 如何用于具体游戏问题
 
@@ -392,7 +392,7 @@ LLC 活动高并不要求外部带宽也高，缓存可以吸收访问；反之�
 4. 用外部工具对照具体 Pass 时间，判断哪个改变影响最大，同时确认图像质量。
 5. 若 FPS 原本封顶，优化后 FPS 可能不变；应看 GPU 时间是否缩短，不能因 FPS 不变就否定收益。
 
-这些实验帮助区分工作量和效率问题。秒级全设备曲线仍不能替代某帧的 Pass 归因。Apple 的 [Metal 性能分析流程](https://developer.apple.com/documentation/xcode/analyzing-the-performance-of-your-metal-app) 也强调把异常帧与 CPU/GPU 时间线联系起来；本工具不采集该时间线。
+这些实验用 Counter 观察工作特征，再用外部耗时验证具体 Pass 的变化。进一步定位方法可参考 Apple 的 [Metal 性能分析流程](https://developer.apple.com/documentation/xcode/analyzing-the-performance-of-your-metal-app)。
 
 ## 8. 正确组织一次数据分析
 
@@ -403,7 +403,7 @@ LLC 活动高并不要求外部带宽也高，缓存可以吸收访问；反之�
 5. **先定位持续区间，再联合看指标**：从 Occupancy、Limiter/Utilization 和读写带宽组合提出候选。不要对混合多个场景的全场均值直接排名根因。
 6. **一次改一个因素，并复测耗时与画质**：必要时转到 Xcode/引擎 Profiler 定位 Pass、dispatch 或 Shader。结论应同时写观察、假设和验证结果。
 
-如果目的是解释某一帧 100 ms 卡顿，本工具的一秒均值可能看不到短尖峰，优先补足逐帧时间线。当前 Counter 列也不包含温度、频率、功率或显存分配量，不从它们单独推断热降频、功耗或资源泄漏。
+一秒均值适合观察持续变化，短尖峰可能被平均稀释；分析单帧异常时，应结合外部逐帧数据。
 
 ## 9. 如何阅读源码
 
@@ -434,4 +434,4 @@ LLC 活动高并不要求外部带宽也高，缓存可以吸收访问；反之�
 - [GPU memory bandwidth](https://developer.apple.com/documentation/xcode/measuring-the-gpus-use-of-memory-bandwidth)：区分带宽与内存容量。
 - [Metal 性能分析流程](https://developer.apple.com/documentation/xcode/analyzing-the-performance-of-your-metal-app)：用更细的时间线继续定位，界面随工具版本变化。
 
-服务连通、离线公式计算成功、真机采集和 Xcode 数值对标是不同层次的证据。本工具未完成跨机型全面验证或同条件 Xcode 绝对数值对标，不能因拿到了数据就宣称所有设备都准确可用。
+服务连通与数值准确性需要分别确认，实际验证范围见 [使用说明](USAGE.md#兼容性与已知限制)。

@@ -118,7 +118,7 @@ result.capture 包含 collection_elapsed_s、sample_count、sample_span_s、row_
 .\.venv\Scripts\python.exe tools\recover_results.py captures\run\rows.json.part --output captures\recovered\rows.json
 ```
 
-恢复逐行读取，只保留完整且通过契约校验的行。缺失最后半行（包括半个中文 UTF-8 字符）可跳过；完整行中的损坏、非法数值、字段变化、倒序或重复窗口均拒绝。源文件不修改，新目标不得已存在。恢复输出标为 partial；没有有效值则 failed，工具退出码为 1，避免自动化把恢复误当成完整采集。恢复只适用于本工具的解析结果 JSON，不承担分析功能。
+恢复逐行读取，只保留完整且通过契约校验的行。缺失最后半行（包括半个中文 UTF-8 字符）可跳过；完整行中的损坏、非法数值、字段变化、倒序或重复窗口均拒绝。源文件不修改，新目标不得已存在。恢复输出标为 partial；没有有效值则 failed，工具退出码为 1，避免自动化把恢复误当成完整采集。恢复对象为本工具的解析结果 JSON。
 
 ## 字段与单位
 
@@ -127,7 +127,7 @@ result.capture 包含 collection_elapsed_s、sample_count、sample_span_s、row_
 - time_ms 是工具加入的毫秒时间列，不是硬件 Counter。
 - 当前 CounterDefinition.unit 为 null；counters 显示 unknown。本项目不根据字段名自动推断单位。
 - 指标按设备给出的 scale 与 maximum 缩放及限幅，不由名称决定。即使显示范围是 0～100，也不能据此认定已完成跨设备单位验收。
-- 带宽的设备说明使用 GB/s，指 GPU 外部内存；未与 Xcode 做绝对对账，也不自动换算 GiB/s 或 MB/s。
+- 带宽的设备说明使用 GB/s，指 GPU 外部内存。导出保留设备公式的数值尺度，跨工具比较前应核对双方单位与统计口径。
 - Limiter 是设备定义的限制相关指标，不能仅凭名称判定瓶颈；短描述字段不补出未经证实的硬件含义。Utilization 是对应路径利用程度，不将不同项相加成总利用率。
 - Occupancy 是并发 SIMD 组相对最大容量的占比，不是显存占用；MMU 字段描述末级缓存未命中后的请求，不是页故障计数。
 - Partial Renders Count 的设备描述为 encoder 内部分渲染次数；所有 Counter 导出仍是有效样本均值，不是秒内总数、每帧次数或 App 独占值。
